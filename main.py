@@ -3,12 +3,7 @@ import argparse
 import os
 import subprocess
 import uuid
-
-from math import ceil
-
 import multiprocessing as mp
-from threading import Lock
-
 import time
 
 def load_config(file_path):
@@ -37,28 +32,9 @@ def get_segments_and_framerate(file, frames_per_segment):
 def frame_to_timestamp(frame, framerate):
     return float(frame / framerate)
 
-
-class encode_watcher:
-    def __init__(self, file_fullpath, in_path, out_path, num_segments):
-        self.file_fullpath = file_fullpath
-        self.in_path = in_path
-        self.out_path = out_path
-        self.num_segments = num_segments
-        self.completed_segments = 0
-        self.lock = Lock()
-
-    def add_segment_completion(self):
-        with self.lock:
-            self.completed_segments = 0
-            if self.completed_segments == self.num_segments:
-                self.mux()
-
-    def mux(self):
-        print(f"Muxing {self.file_fullpath}")
-
 class encode_segment:
     def __init__(self, framerate, file_fullpath, out_path, segment_start, segment_end, ffmpeg_video_string, preset,
-                 filename):
+                 filename, encode_job):
         self.framerate = framerate
         self.file_fullpath = file_fullpath
         self.out_path = out_path
@@ -68,6 +44,7 @@ class encode_segment:
         self.preset = preset
         self.filename = filename
         self.uuid = uuid.uuid4()
+        self.encode_job = encode_job
 
     def encode(self, hostname, current_user):
         cmd = (
@@ -89,9 +66,16 @@ class encode_job:
         self.preset = preset
         self.out_path = out_path
         self.filename = filename
+        self.segments_completed = 0
 
         if not os.path.isdir(f"{self.out_path}/{preset['name']}/"):
             os.makedirs(f"{self.out_path}/{preset['name']}/")
+
+    def tally_completed_segments(self):
+        self.segments_completed += 1
+        print(f"HEY IDIOT LOOK HERE {self.segments_completed}")
+        if self.segments_completed == self.num_segments:
+            print("do muxing here...")
 
     def create_segment_encode_list(self):
         segment_list = []
@@ -99,7 +83,8 @@ class encode_job:
             segment_list += [encode_segment(framerate=self.framerate, file_fullpath=self.input_file,
                 out_path=self.out_path, ffmpeg_video_string=self.preset['ffmpeg_video_string'],
                 segment_start = (x * self.frames_per_segment) + 1,
-                segment_end = (x + 1) * self.frames_per_segment, preset=self.preset, filename=self.filename)]
+                segment_end = (x + 1) * self.frames_per_segment, preset=self.preset, filename=self.filename,
+                encode_job=self)]
         return segment_list
 
 class encode_worker(mp.Process):
@@ -138,10 +123,11 @@ def job_handler(segment_list, worker_list, segment_queue, results_queue):
                 print(results)
                 for segment in segment_list:
                     if segment.uuid == results[0].uuid:
+                        segment.encode_job.tally_completed_segments()
                         segment_list.remove(segment)
                         break
 
-            elif worker.is_running() == False:
+            elif not worker.is_running():
                 print(worker.is_running())
                 segment_queue.put(segment_list[segment_index])
                 print(f"Running {segment_list[segment_index]} on {worker.hostname}")
@@ -191,10 +177,12 @@ def main():
         worker_list[len(worker_list)-1].start()
 
     job_list = sorted(job_list, key=lambda x: x.proper_name)
+    job_segment_list = []
     for jobs in job_list:
         print(jobs.proper_name)
-        job_segment_list = jobs.create_segment_encode_list()
-        job_handler(job_segment_list, worker_list, segment_queue, results_queue)
+        job_segment_list += jobs.create_segment_encode_list()
+
+    job_handler(job_segment_list, worker_list, segment_queue, results_queue)
 
 if __name__ == "__main__":
     main()
