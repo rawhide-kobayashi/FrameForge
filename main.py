@@ -2,6 +2,7 @@ import yaml
 import argparse
 import os
 import subprocess
+import uuid
 
 from math import ceil
 
@@ -66,6 +67,7 @@ class encode_segment:
         self.ffmpeg_video_string = ffmpeg_video_string
         self.preset = preset
         self.filename = filename
+        self.uuid = uuid.uuid4()
 
     def encode(self, hostname, current_user):
         cmd = (
@@ -82,7 +84,7 @@ class encode_job:
     def __init__(self, proper_name, input_file, preset, out_path, filename):
         self.input_file = input_file
         self.proper_name = proper_name
-        self.frames_per_segment = 2000
+        self.frames_per_segment = 100
         self.num_segments, self.framerate = get_segments_and_framerate(self.input_file, self.frames_per_segment)
         self.preset = preset
         self.out_path = out_path
@@ -113,8 +115,9 @@ class encode_worker(mp.Process):
         while True:
             while not self.running.value:
                 if not self.segment_queue.empty():
-                    stdout, stderr, returncode = self.execute_encode(segment_to_encode=self.segment_queue.get())
-                    self.results_queue.put((returncode, stdout, stderr))
+                    segment_to_encode = self.segment_queue.get()
+                    stdout, stderr, returncode = self.execute_encode(segment_to_encode=segment_to_encode)
+                    self.results_queue.put((segment_to_encode, returncode, stdout, stderr))
                     self.running.value = False
             time.sleep(1)
 
@@ -130,16 +133,21 @@ def job_handler(segment_list, worker_list, segment_queue, results_queue):
     while len(segment_list) > 0:
         segment_index = 0
         for worker in worker_list:
-            if worker.is_running() == False and segment_index < len(segment_list):
+            if not results_queue.empty():
+                results = results_queue.get()
+                print(results)
+                for segment in segment_list:
+                    if segment.uuid == results[0].uuid:
+                        segment_list.remove(segment)
+                        break
+
+            elif worker.is_running() == False:
                 print(worker.is_running())
                 segment_queue.put(segment_list[segment_index])
                 print(f"Running {segment_list[segment_index]} on {worker.hostname}")
-
-            if not results_queue.empty():
-                print(results_queue.get())
+                segment_index += 1
 
             time.sleep(1)
-            segment_index += 1
 
 
 
