@@ -9,6 +9,8 @@ from math import ceil
 
 import asyncio
 
+import multiprocessing as mp
+
 from threading import Lock
 
 def load_config(file_path):
@@ -77,11 +79,11 @@ class encode_segment:
             f"{self.file_fullpath} {self.ffmpeg_video_string} {self.out_path}/{self.preset['name']}/{self.segment_start}"
             f"-{self.segment_end}_{self.filename}'"
         )
-        #process = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE,
-        #    stderr=asyncio.subprocess.PIPE)
-        #stdout, stderr = await process.communicate()
         print(cmd)
-        return 0, "test"
+        process = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE)
+        stdout, stderr = await process.communicate()
+        return stdout, stderr, process.returncode
 
 class encode_job:
     def __init__(self, proper_name, input_file, preset, out_path, filename):
@@ -92,6 +94,9 @@ class encode_job:
         self.preset = preset
         self.out_path = out_path
         self.filename = filename
+
+        if not os.path.isdir(f"{self.out_path}/{preset['name']}/"):
+            os.makedirs(f"{self.out_path}/{preset['name']}/")
 
     def create_segment_encode_list(self):
         segment_list = []
@@ -113,16 +118,21 @@ class encode_worker:
 
     async def execute_encode(self, segment_to_encode):
         self.running = True
-        job_returncode, last_stdout_line = await segment_to_encode.encode(self.hostname, self.current_user)
+        stdout, stderr, returncode = await segment_to_encode.encode(self.hostname, self.current_user)
+        self.running = False
+        return stdout, stderr, returncode
 
 async def job_handler(segment_list, worker_list):
     while len(segment_list) > 0:
         segment_index = 0
         for worker in worker_list:
             if await worker.is_running() == False and segment_index < len(segment_list):
-                worker.execute_encode(segment_list[segment_index])
+                stdout, stderr, returncode = await asyncio.create_task(worker.execute_encode(segment_list[segment_index]))
                 print(f"Running {segment_list[segment_index]} on {worker.hostname}")
-                segment_index += 1
+                print(stdout, stderr, returncode)
+                if returncode == 0:
+                    segment_list.pop(segment_index)
+                    segment_index += 1
 
         await asyncio.sleep(1)
 
@@ -160,7 +170,7 @@ async def main():
 
     for worker in config['nodes']:
         print(worker['hostname'])
-        worker_list += [encode_worker(hostname=worker, current_user=current_user)]
+        worker_list += [encode_worker(hostname=worker['hostname'], current_user=current_user)]
 
     job_list = sorted(job_list, key=lambda x: x.proper_name)
     for jobs in job_list:
