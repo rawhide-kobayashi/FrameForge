@@ -1,5 +1,3 @@
-import threading
-
 import yaml
 import argparse
 import os
@@ -7,11 +5,10 @@ import subprocess
 
 from math import ceil
 
-import asyncio
-
 import multiprocessing as mp
-
 from threading import Lock
+
+import time
 
 def load_config(file_path):
     with open(file_path, 'r') as file:
@@ -70,19 +67,15 @@ class encode_segment:
         self.preset = preset
         self.filename = filename
 
-    async def encode(self, hostname, current_user):
-        #subprocess.run(f"ssh {current_user}@{hostname} '{ffmpeg_video_string}'" stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        #print(f"ssh {current_user}@{hostname} 'ffmpeg -ss {self.segment_start} -to {self.segment_end} \
-        #-i {self.file_fullpath} {self.ffmpeg_video_string} {self.out_path}/{self.preset['name']}/{self.filename}'")
+    def encode(self, hostname, current_user):
         cmd = (
-            f"ssh {current_user}@{hostname} 'ffmpeg -ss {self.segment_start} -to {self.segment_end} -i "
+            f"ssh -t {current_user}@{hostname} 'ffmpeg -ss {self.segment_start} -to {self.segment_end} -i "
             f"{self.file_fullpath} {self.ffmpeg_video_string} {self.out_path}/{self.preset['name']}/{self.segment_start}"
             f"-{self.segment_end}_{self.filename}'"
         )
         print(cmd)
-        process = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE)
-        stdout, stderr = await process.communicate()
+        process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        stdout, stderr = process.communicate()
         return stdout, stderr, process.returncode
 
 class encode_job:
@@ -107,39 +100,51 @@ class encode_job:
                 segment_end = (x + 1) * self.frames_per_segment, preset=self.preset, filename=self.filename)]
         return segment_list
 
-class encode_worker:
-    def __init__(self, hostname, current_user):
+class encode_worker(mp.Process):
+    def __init__(self, hostname, current_user, segment_queue, results_queue):
+        super().__init__()
         self.hostname = hostname
         self.current_user = current_user
-        self.running = False
+        self.segment_queue = segment_queue
+        self.results_queue = results_queue
+        self.running = mp.Value('b', False)
 
-    async def is_running(self):
-        return self.running
+    def run(self):
+        while True:
+            while not self.running.value:
+                if not self.segment_queue.empty():
+                    stdout, stderr, returncode = self.execute_encode(segment_to_encode=self.segment_queue.get())
+                    self.results_queue.put((returncode, stdout, stderr))
+                    self.running.value = False
+            time.sleep(1)
 
-    async def execute_encode(self, segment_to_encode):
-        self.running = True
-        stdout, stderr, returncode = await segment_to_encode.encode(self.hostname, self.current_user)
-        self.running = False
+    def is_running(self):
+        return self.running.value
+
+    def execute_encode(self, segment_to_encode):
+        self.running.value = True
+        stdout, stderr, returncode = segment_to_encode.encode(self.hostname, self.current_user)
         return stdout, stderr, returncode
 
-async def job_handler(segment_list, worker_list):
+def job_handler(segment_list, worker_list, segment_queue, results_queue):
     while len(segment_list) > 0:
         segment_index = 0
         for worker in worker_list:
-            if await worker.is_running() == False and segment_index < len(segment_list):
-                stdout, stderr, returncode = await asyncio.create_task(worker.execute_encode(segment_list[segment_index]))
+            if worker.is_running() == False and segment_index < len(segment_list):
+                print(worker.is_running())
+                segment_queue.put(segment_list[segment_index])
                 print(f"Running {segment_list[segment_index]} on {worker.hostname}")
-                print(stdout, stderr, returncode)
-                if returncode == 0:
-                    segment_list.pop(segment_index)
-                    segment_index += 1
 
-        await asyncio.sleep(1)
+            if not results_queue.empty():
+                print(results_queue.get())
 
-
+            time.sleep(1)
+            segment_index += 1
 
 
-async def main():
+
+
+def main():
     current_user = os.getlogin()
 
     parser = argparse.ArgumentParser(description="Load a YAML configuration file.")
@@ -168,16 +173,20 @@ async def main():
             job_list += [encode_job(proper_name=f"{preset['name']}_{file}", input_file=file_fullpath, preset=preset,
                 out_path=args.out_path, filename=file)]
 
+    segment_queue = mp.Queue()
+    results_queue = mp.Queue()
+
     for worker in config['nodes']:
         print(worker['hostname'])
-        worker_list += [encode_worker(hostname=worker['hostname'], current_user=current_user)]
+        worker_list += [encode_worker(hostname=worker['hostname'], current_user=current_user,
+                        segment_queue=segment_queue, results_queue=results_queue)]
+        worker_list[len(worker_list)-1].start()
 
     job_list = sorted(job_list, key=lambda x: x.proper_name)
     for jobs in job_list:
         print(jobs.proper_name)
         job_segment_list = jobs.create_segment_encode_list()
-
-        await job_handler(job_segment_list, worker_list)
+        job_handler(job_segment_list, worker_list, segment_queue, results_queue)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
