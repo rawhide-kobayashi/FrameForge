@@ -1,0 +1,35 @@
+nodes:
+  - hostname: node1.local.domain
+  - hostname: node2.whateverdomain
+  - hostname: 104.135.233.98
+
+additional_content:
+  - path: '/mnt/content/containing/subtitles/to/mux/'
+    types:
+      - subtitle
+    file_extension: .ass
+  - path: '/mnt/content/containing/subtitles/and/audio/to/mux/'
+    types:
+      - audio
+      - subtitle
+    file_extension: .mkv
+  - path: '/mnt/content/containing/audio/to/mux/'
+    types:
+      - audio
+    file_extension: .m2ts
+  - path: '/mnt/content/containing/chapters/and/fonts/to/mux/'
+    types:
+      - chapters
+      - attachments
+    file_extension: .mkv
+
+presets:
+  - name: 1080p_placebo
+    ffmpeg_video_string: '-c:v libx265 -preset placebo -tune animation -pix_fmt yuv444p10 -profile:v main444-10 -x265-params "bframes=16:psy-rd=2:psy-rdoq=4:aq-mode=4:qcomp=0.8:limit-sao=1:no-strong-intra-smoothing=1:deblock=-1,-1:ref=6:pmode=1" -crf 12 -y'
+    ffmpeg_audio_string: '-vn -c:v copy -async 1'
+  - name: 1080p_normal
+    ffmpeg_video_string: '-c:v libx265 -preset placebo -tune animation -pix_fmt yuv420p10 -profile:v main10 -x265-params "bframes=16:psy-rd=2:psy-rdoq=4:aq-mode=4:qcomp=0.8:ref=6:pmode=1" -crf 18 -y'
+    ffmpeg_audio_string: '-vn -c:a libopus -b:a 192k -async 1'
+  - name: 720p_cringe
+    ffmpeg_video_string: '-c:v libx265 -preset placebo -tune animation -pix_fmt yuv420p10 -profile:v main10 -x265-params "bframes=16:psy-rd=2:psy-rdoq=4:aq-mode=4:qcomp=0.8:ref=6:pmode=1" -vf scale=1280:720 -sws_flags spline -crf 24 -y'
+    ffmpeg_audio_string: '-vn -c:a libopus -b:a 128k -async 1'
