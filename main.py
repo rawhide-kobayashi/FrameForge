@@ -5,6 +5,7 @@ import subprocess
 import uuid
 import multiprocessing as mp
 import time
+import re
 
 def load_config(file_path):
     with open(file_path, 'r') as file:
@@ -32,6 +33,9 @@ def get_segments_and_framerate(file, frames_per_segment):
 def frame_to_timestamp(frame, framerate):
     return float(frame / framerate)
 
+def seconds_to_frames(seconds, framerate):
+    return round(framerate * seconds)
+
 class encode_segment:
     def __init__(self, framerate, file_fullpath, out_path, segment_start, segment_end, ffmpeg_video_string, preset,
                  filename, encode_job):
@@ -46,12 +50,36 @@ class encode_segment:
         self.uuid = uuid.uuid4()
         self.encode_job = encode_job
         self.assigned = False
+        self.file_output_fstring = (f"{self.out_path}/{self.preset['name']}/{self.segment_start}-{self.segment_end}_"
+                                    f"{self.filename}")
+
+    def check_if_exists(self):
+        cmd = [
+            'ffprobe', '-v', 'error', '-select_streams', 'v',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            '-show_entries', 'format=duration', self.file_output_fstring
+        ]
+
+        if os.path.isfile(self.file_output_fstring):
+            duration = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if duration.returncode == 0:
+                duration = float(duration.stdout.strip())
+                if seconds_to_frames(duration, self.framerate) == seconds_to_frames((self.segment_end -
+                    self.segment_start), self.framerate):
+                    return True
+                else:
+                    os.remove(self.file_output_fstring)
+                    return False
+            else:
+                os.remove(self.file_output_fstring)
+                return False
+        else:
+            return False
 
     def encode(self, hostname, current_user):
         cmd = (
             f"ssh -t {current_user}@{hostname} 'ffmpeg -ss {self.segment_start} -to {self.segment_end} -i "
-            f"{self.file_fullpath} {self.ffmpeg_video_string} {self.out_path}/{self.preset['name']}/{self.segment_start}"
-            f"-{self.segment_end}_{self.filename}'"
+            f"{self.file_fullpath} {self.ffmpeg_video_string} {self.file_output_fstring}'"
         )
         print(cmd)
         process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -68,15 +96,20 @@ class encode_job:
         self.out_path = out_path
         self.filename = filename
         self.segments_completed = 0
+        self.completed_segment_filename_list = []
 
         if not os.path.isdir(f"{self.out_path}/{preset['name']}/"):
             os.makedirs(f"{self.out_path}/{preset['name']}/")
 
-    def tally_completed_segments(self):
+    def tally_completed_segments(self, filename):
         self.segments_completed += 1
         print(f"HEY IDIOT LOOK HERE {self.segments_completed}")
+        self.completed_segment_filename_list.append(filename)
+        self.completed_segment_filename_list = sorted(self.completed_segment_filename_list, key=lambda x: float(re.search(r'/(\d+\.\d+)-', x).group(1)))
+        print(self.completed_segment_filename_list)
         if self.segments_completed == self.num_segments:
             print("do muxing here...")
+            self.completed_segment_filename_list = sorted(self.completed_segment_filename_list)
 
     def create_segment_encode_list(self):
         segment_list = []
@@ -111,6 +144,11 @@ class encode_worker(mp.Process):
         return stdout, stderr, returncode
 
 def job_handler(segment_list, worker_list, results_queue):
+    for segment in segment_list:
+        if segment.check_if_exists():
+            segment.encode_job.tally_completed_segments(segment.file_output_fstring)
+            segment_list.remove(segment)
+
     segment_index = 0
     while len(segment_list) > 0:
         while segment_list[segment_index].assigned == True:
@@ -123,7 +161,7 @@ def job_handler(segment_list, worker_list, results_queue):
                     print(results)
                     for segment in segment_list:
                         if segment.uuid == results[0].uuid:
-                            segment.encode_job.tally_completed_segments()
+                            segment.encode_job.tally_completed_segments(segment.file_output_fstring)
                             segment_list.remove(segment)
                             break
                     worker.current_segment.value = None
@@ -133,6 +171,7 @@ def job_handler(segment_list, worker_list, results_queue):
                     worker.is_running.value = True
                     print(f"Running {segment_list[segment_index]} on {worker.hostname}")
                     segment_list[segment_index].assigned = True
+                    segment_index += 1
 
         segment_index = 0
         time.sleep(1)
@@ -156,7 +195,7 @@ def main():
     print(args.in_path)
     print(args.out_path)
 
-    job_list = mp.Manager().list([])
+    job_list = []
     worker_list = []
 
     for file in os.listdir(args.in_path):
