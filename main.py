@@ -6,6 +6,7 @@ import uuid
 import multiprocessing as mp
 import time
 import re
+import math
 
 def load_config(file_path):
     with open(file_path, 'r') as file:
@@ -27,7 +28,7 @@ def get_segments_and_framerate(file, frames_per_segment):
     framerate_num, framerate_denom = map(float, framerate.stdout.strip().split('/'))
     duration_seconds = subprocess.run(duration_seconds_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     duration_seconds = float(duration_seconds.stdout.strip())
-    return int(((framerate_num / framerate_denom) * duration_seconds)  / frames_per_segment), \
+    return math.ceil(int((framerate_num / framerate_denom) * duration_seconds)  / frames_per_segment), \
         float(framerate_num / framerate_denom)
 
 def frame_to_timestamp(frame, framerate):
@@ -50,10 +51,10 @@ class encode_segment:
         self.uuid = uuid.uuid4()
         self.encode_job = encode_job
         self.assigned = False
-        self.file_output_fstring = (f"{self.out_path}/{self.preset['name']}/{self.segment_start}-{self.segment_end}_"
-                                    f"{self.filename}")
+        self.file_output_fstring = (f"{self.out_path}/{self.preset['name']}/temp/{filename}/{self.segment_start}-"
+                                    f"{self.segment_end}_{self.filename}")
 
-    def check_if_exists(self, encode_job):
+    def check_if_exists(self):
         cmd = [
             'ffprobe', '-v', 'error', '-select_streams', 'v',
             '-of', 'default=noprint_wrappers=1:nokey=1',
@@ -65,7 +66,7 @@ class encode_segment:
                 duration = float(duration.stdout.strip())
                 if seconds_to_frames(duration, self.framerate) == seconds_to_frames((self.segment_end -
                     self.segment_start), self.framerate):
-                    encode_job.tally_completed_segments(self.file_output_fstring)
+                    self.encode_job.tally_completed_segments(self.file_output_fstring)
                     return True
                 else:
                     os.remove(self.file_output_fstring)
@@ -90,7 +91,7 @@ class encode_job:
     def __init__(self, proper_name, input_file, preset, out_path, filename):
         self.input_file = input_file
         self.proper_name = proper_name
-        self.frames_per_segment = 100
+        self.frames_per_segment = 2000
         self.num_segments, self.framerate = get_segments_and_framerate(self.input_file, self.frames_per_segment)
         self.preset = preset
         self.out_path = out_path
@@ -98,15 +99,18 @@ class encode_job:
         self.segments_completed = 0
         self.completed_segment_filename_list = []
 
-        if not os.path.isdir(f"{self.out_path}/{preset['name']}/"):
-            os.makedirs(f"{self.out_path}/{preset['name']}/")
+        if not os.path.isdir(f"{self.out_path}/{preset['name']}/temp/{filename}/"):
+            os.makedirs(f"{self.out_path}/{preset['name']}/temp/{filename}/")
 
     def tally_completed_segments(self, filename):
         self.segments_completed += 1
         self.completed_segment_filename_list.append(filename)
+        print(self.segments_completed)
+        print(self.proper_name)
         if self.segments_completed == self.num_segments:
             print("do muxing here...")
             self.completed_segment_filename_list = sorted(self.completed_segment_filename_list, key=lambda x: float(re.search(r'/(\d+\.\d+)-', x).group(1)))
+            print(self.completed_segment_filename_list)
 
     def create_segment_encode_list(self):
         segment_list = []
@@ -116,7 +120,6 @@ class encode_job:
                 segment_start = x * self.frames_per_segment,
                 segment_end = (x + 1) * self.frames_per_segment, preset=self.preset, filename=self.filename,
                 encode_job=self)]
-            print(x * self.frames_per_segment, ((x + 1) * self.frames_per_segment) - 1)
         return segment_list
 
 class encode_worker(mp.Process):
@@ -131,7 +134,6 @@ class encode_worker(mp.Process):
     def run(self):
         while True:
             if not self.current_segment.value == None and self.is_running.value == True:
-                print(self.current_segment.value)
                 stdout, stderr, returncode = self.execute_encode(segment_to_encode=self.current_segment.value)
                 self.results_queue.put((self.current_segment.value, returncode, stdout, stderr))
                 self.is_running.value = False
@@ -142,14 +144,8 @@ class encode_worker(mp.Process):
         return stdout, stderr, returncode
 
 def job_handler(segment_list, worker_list, results_queue):
-    #for segment in segment_list:
-    #    if segment.check_if_exists():
-    #        segment.encode_job.tally_completed_segments(segment.file_output_fstring)
-    #        print(f"removing {segment.file_output_fstring}")
-    #        segment_list.remove(segment)
-    #        segment.
 
-    segment_list[:] = [segment for segment in segment_list if not segment.check_if_exists(segment.encode_job)]
+    segment_list[:] = [segment for segment in segment_list if not segment.check_if_exists()]
 
     segment_index = 0
     while len(segment_list) > 0:
@@ -210,7 +206,6 @@ def main():
             job_list += [encode_job(proper_name=f"{preset['name']}_{file}", input_file=file_fullpath, preset=preset,
                 out_path=args.out_path, filename=file)]
 
-    #segment_queue = mp.Queue()
     results_queue = mp.Queue()
 
     job_list = sorted(job_list, key=lambda x: x.proper_name)
