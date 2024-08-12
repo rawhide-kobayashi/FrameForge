@@ -53,27 +53,24 @@ class encode_segment:
         self.file_output_fstring = (f"{self.out_path}/{self.preset['name']}/{self.segment_start}-{self.segment_end}_"
                                     f"{self.filename}")
 
-    def check_if_exists(self):
+    def check_if_exists(self, encode_job):
         cmd = [
             'ffprobe', '-v', 'error', '-select_streams', 'v',
             '-of', 'default=noprint_wrappers=1:nokey=1',
             '-show_entries', 'format=duration', self.file_output_fstring
         ]
-        print(self.file_output_fstring)
-        if os.path.exists(self.file_output_fstring):
+        if os.path.isfile(self.file_output_fstring):
             duration = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             if duration.returncode == 0:
                 duration = float(duration.stdout.strip())
                 if seconds_to_frames(duration, self.framerate) == seconds_to_frames((self.segment_end -
                     self.segment_start), self.framerate):
-                    print(f"saving {self.file_output_fstring}")
+                    encode_job.tally_completed_segments(self.file_output_fstring)
                     return True
                 else:
-                    print(f"remove {self.file_output_fstring} why?")
                     os.remove(self.file_output_fstring)
                     return False
             else:
-                print(f"remove {self.file_output_fstring} why? (bad returncode)")
                 os.remove(self.file_output_fstring)
                 return False
         else:
@@ -145,12 +142,14 @@ class encode_worker(mp.Process):
         return stdout, stderr, returncode
 
 def job_handler(segment_list, worker_list, results_queue):
-    for segment in segment_list:
-        print(segment.file_output_fstring)
-        if segment.check_if_exists():
-            segment.encode_job.tally_completed_segments(segment.file_output_fstring)
-            print(f"removing {segment.file_output_fstring}")
-            segment_list.remove(segment)
+    #for segment in segment_list:
+    #    if segment.check_if_exists():
+    #        segment.encode_job.tally_completed_segments(segment.file_output_fstring)
+    #        print(f"removing {segment.file_output_fstring}")
+    #        segment_list.remove(segment)
+    #        segment.
+
+    segment_list[:] = [segment for segment in segment_list if not segment.check_if_exists(segment.encode_job)]
 
     segment_index = 0
     while len(segment_list) > 0:
