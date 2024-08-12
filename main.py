@@ -31,7 +31,7 @@ def get_segments_and_framerate(file, frames_per_segment):
         float(framerate_num / framerate_denom)
 
 def frame_to_timestamp(frame, framerate):
-    return float(frame / framerate)
+    return round(float(frame / framerate), 5)
 
 def seconds_to_frames(seconds, framerate):
     return round(framerate * seconds)
@@ -59,18 +59,21 @@ class encode_segment:
             '-of', 'default=noprint_wrappers=1:nokey=1',
             '-show_entries', 'format=duration', self.file_output_fstring
         ]
-
-        if os.path.isfile(self.file_output_fstring):
+        print(self.file_output_fstring)
+        if os.path.exists(self.file_output_fstring):
             duration = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             if duration.returncode == 0:
                 duration = float(duration.stdout.strip())
                 if seconds_to_frames(duration, self.framerate) == seconds_to_frames((self.segment_end -
                     self.segment_start), self.framerate):
+                    print(f"saving {self.file_output_fstring}")
                     return True
                 else:
+                    print(f"remove {self.file_output_fstring} why?")
                     os.remove(self.file_output_fstring)
                     return False
             else:
+                print(f"remove {self.file_output_fstring} why? (bad returncode)")
                 os.remove(self.file_output_fstring)
                 return False
         else:
@@ -103,22 +106,20 @@ class encode_job:
 
     def tally_completed_segments(self, filename):
         self.segments_completed += 1
-        print(f"HEY IDIOT LOOK HERE {self.segments_completed}")
         self.completed_segment_filename_list.append(filename)
-        self.completed_segment_filename_list = sorted(self.completed_segment_filename_list, key=lambda x: float(re.search(r'/(\d+\.\d+)-', x).group(1)))
-        print(self.completed_segment_filename_list)
         if self.segments_completed == self.num_segments:
             print("do muxing here...")
-            self.completed_segment_filename_list = sorted(self.completed_segment_filename_list)
+            self.completed_segment_filename_list = sorted(self.completed_segment_filename_list, key=lambda x: float(re.search(r'/(\d+\.\d+)-', x).group(1)))
 
     def create_segment_encode_list(self):
         segment_list = []
         for x in range(self.num_segments):
             segment_list += [encode_segment(framerate=self.framerate, file_fullpath=self.input_file,
                 out_path=self.out_path, ffmpeg_video_string=self.preset['ffmpeg_video_string'],
-                segment_start = (x * self.frames_per_segment) + 1,
-                segment_end = ((x + 1) * self.frames_per_segment) + 1, preset=self.preset, filename=self.filename,
+                segment_start = x * self.frames_per_segment,
+                segment_end = (x + 1) * self.frames_per_segment, preset=self.preset, filename=self.filename,
                 encode_job=self)]
+            print(x * self.frames_per_segment, ((x + 1) * self.frames_per_segment) - 1)
         return segment_list
 
 class encode_worker(mp.Process):
@@ -145,8 +146,10 @@ class encode_worker(mp.Process):
 
 def job_handler(segment_list, worker_list, results_queue):
     for segment in segment_list:
+        print(segment.file_output_fstring)
         if segment.check_if_exists():
             segment.encode_job.tally_completed_segments(segment.file_output_fstring)
+            print(f"removing {segment.file_output_fstring}")
             segment_list.remove(segment)
 
     segment_index = 0
