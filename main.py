@@ -45,6 +45,7 @@ class encode_segment:
         self.filename = filename
         self.uuid = uuid.uuid4()
         self.encode_job = encode_job
+        self.assigned = False
 
     def encode(self, hostname, current_user):
         cmd = (
@@ -88,52 +89,53 @@ class encode_job:
         return segment_list
 
 class encode_worker(mp.Process):
-    def __init__(self, hostname, current_user, segment_queue, results_queue):
+    def __init__(self, hostname, current_user, results_queue):
         super().__init__()
         self.hostname = hostname
         self.current_user = current_user
-        self.segment_queue = segment_queue
+        self.current_segment = mp.Manager().Value(typecode=None, value=None)
         self.results_queue = results_queue
-        self.running = mp.Value('b', False)
+        self.is_running = mp.Value('b', False)
 
     def run(self):
         while True:
-            while not self.running.value:
-                if not self.segment_queue.empty():
-                    segment_to_encode = self.segment_queue.get()
-                    stdout, stderr, returncode = self.execute_encode(segment_to_encode=segment_to_encode)
-                    self.results_queue.put((segment_to_encode, returncode, stdout, stderr))
-                    self.running.value = False
+            if not self.current_segment.value == None and self.is_running.value == True:
+                print(self.current_segment.value)
+                stdout, stderr, returncode = self.execute_encode(segment_to_encode=self.current_segment.value)
+                self.results_queue.put((self.current_segment.value, returncode, stdout, stderr))
+                self.is_running.value = False
             time.sleep(1)
 
-    def is_running(self):
-        return self.running.value
-
     def execute_encode(self, segment_to_encode):
-        self.running.value = True
         stdout, stderr, returncode = segment_to_encode.encode(self.hostname, self.current_user)
         return stdout, stderr, returncode
 
-def job_handler(segment_list, worker_list, segment_queue, results_queue):
+def job_handler(segment_list, worker_list, results_queue):
+    segment_index = 0
     while len(segment_list) > 0:
-        segment_index = 0
+        while segment_list[segment_index].assigned == True:
+            segment_index += 1
+
         for worker in worker_list:
-            if not results_queue.empty():
-                results = results_queue.get()
-                print(results)
-                for segment in segment_list:
-                    if segment.uuid == results[0].uuid:
-                        segment.encode_job.tally_completed_segments()
-                        segment_list.remove(segment)
-                        break
+            if worker.current_segment.value == None or worker.is_running.value == False:
+                if not results_queue.empty():
+                    results = results_queue.get()
+                    print(results)
+                    for segment in segment_list:
+                        if segment.uuid == results[0].uuid:
+                            segment.encode_job.tally_completed_segments()
+                            segment_list.remove(segment)
+                            break
+                    worker.current_segment.value = None
 
-            elif not worker.is_running():
-                print(worker.is_running())
-                segment_queue.put(segment_list[segment_index])
-                print(f"Running {segment_list[segment_index]} on {worker.hostname}")
-                segment_index += 1
+                else:
+                    worker.current_segment.value = segment_list[segment_index]
+                    worker.is_running.value = True
+                    print(f"Running {segment_list[segment_index]} on {worker.hostname}")
+                    segment_list[segment_index].assigned = True
 
-            time.sleep(1)
+        segment_index = 0
+        time.sleep(1)
 
 
 
@@ -154,7 +156,7 @@ def main():
     print(args.in_path)
     print(args.out_path)
 
-    job_list = []
+    job_list = mp.Manager().list([])
     worker_list = []
 
     for file in os.listdir(args.in_path):
@@ -167,14 +169,8 @@ def main():
             job_list += [encode_job(proper_name=f"{preset['name']}_{file}", input_file=file_fullpath, preset=preset,
                 out_path=args.out_path, filename=file)]
 
-    segment_queue = mp.Queue()
+    #segment_queue = mp.Queue()
     results_queue = mp.Queue()
-
-    for worker in config['nodes']:
-        print(worker['hostname'])
-        worker_list += [encode_worker(hostname=worker['hostname'], current_user=current_user,
-                        segment_queue=segment_queue, results_queue=results_queue)]
-        worker_list[len(worker_list)-1].start()
 
     job_list = sorted(job_list, key=lambda x: x.proper_name)
     job_segment_list = []
@@ -182,7 +178,13 @@ def main():
         print(jobs.proper_name)
         job_segment_list += jobs.create_segment_encode_list()
 
-    job_handler(job_segment_list, worker_list, segment_queue, results_queue)
+    for worker in config['nodes']:
+        print(worker['hostname'])
+        worker_list += [encode_worker(hostname=worker['hostname'], current_user=current_user,
+                        results_queue=results_queue)]
+        worker_list[len(worker_list)-1].start()
+
+    job_handler(job_segment_list, worker_list, results_queue)
 
 if __name__ == "__main__":
     main()
