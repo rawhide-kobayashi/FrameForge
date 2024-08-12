@@ -84,7 +84,7 @@ class encode_job:
             segment_list += [encode_segment(framerate=self.framerate, file_fullpath=self.input_file,
                 out_path=self.out_path, ffmpeg_video_string=self.preset['ffmpeg_video_string'],
                 segment_start = (x * self.frames_per_segment) + 1,
-                segment_end = (x + 1) * self.frames_per_segment, preset=self.preset, filename=self.filename,
+                segment_end = ((x + 1) * self.frames_per_segment) + 1, preset=self.preset, filename=self.filename,
                 encode_job=self)]
         return segment_list
 
