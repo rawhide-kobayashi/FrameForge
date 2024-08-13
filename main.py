@@ -57,11 +57,16 @@ class mux_worker(mp.Process):
             for x in self.completed_segment_filename_list:
                 mux.write(f"file '{x}'\n")
 
-        ffmpeg_concat_string = (f"ffmpeg -f concat -safe -0 -i {self.out_path}/{self.preset['name']}/temp/"
-                                f"{self.filename}/mux.txt -c copy {self.out_path}/{self.preset['name']}/temp/"
-                                f"{self.filename}/{shlex.quote(self.filename)} -y")
+        #ffmpeg_concat_string = (f"ffmpeg -f concat -safe -0 -i {self.out_path}/{self.preset['name']}/temp/"
+        #                        f"{self.filename}/mux.txt -c copy {self.out_path}/{self.preset['name']}/temp/"
+        #                        f"{self.filename}/{shlex.quote(self.filename)} -y")
+        ffmpeg_concat_string = [
+            f"ffmpeg -f concat -safe -0 -i "
+            f'"{self.out_path}/{self.preset['name']}/temp/{self.filename}/mux.txt" -c copy '
+            f'"{self.out_path}/{self.preset['name']}/temp/{self.filename}/{self.filename}" -y'
+        ]
         print(ffmpeg_concat_string)
-        process = subprocess.Popen(ffmpeg_concat_string, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process = subprocess.Popen(ffmpeg_concat_string, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
         stdout, stderr = process.communicate()
         print(stdout, stderr, process.returncode)
         os.remove(f"{self.out_path}/{self.preset['name']}/temp/{self.filename}/mux.txt")
@@ -91,7 +96,7 @@ class encode_segment:
         cmd = [
             'ffprobe', '-v', 'error', '-select_streams', 'v',
             '-of', 'default=noprint_wrappers=1:nokey=1',
-            '-show_entries', 'format=duration', shlex.quote(self.file_output_fstring)
+            '-show_entries', 'format=duration', self.file_output_fstring
         ]
         if os.path.isfile(self.file_output_fstring):
             duration = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -113,11 +118,14 @@ class encode_segment:
 
     def encode(self, hostname, current_user):
         cmd = (
-            f"ssh -t {current_user}@{hostname} 'ffmpeg -ss {self.segment_start} -to {self.segment_end} -i "
-            f"{self.file_fullpath} {self.ffmpeg_video_string} {shlex.quote(self.file_output_fstring)}'"
+            f'ssh -t {current_user}@{hostname} "ffmpeg -ss {self.segment_start} -to {self.segment_end} -i '
+            f'\\"{self.file_fullpath}\\" '
+            f"{self.ffmpeg_video_string} "
+            f'\\"{self.file_output_fstring}\\"'
+            f'"'
         )
         print(cmd)
-        process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
         stdout, stderr = process.communicate()
         return stdout, stderr, process.returncode
 
