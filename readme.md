@@ -1,8 +1,6 @@
-Requires ffmpeg, pyaml, optionally mkvtoolnix for any complex muxing.
+Requires ffmpeg, pyaml, mkvtoolnix. Currently only compatible with unix-like operating systems (WSL should work too, but I haven't tested it yet)
 
-This project makes several assumptions about your file setup.
-- Videos have a number schema in the name matching "xx" - i.e. for a series of 12 episodes, they are numbered 01-12.
-- Additional files containing whatever additional data that you desire to mux also are available with the same numbering schema, but their names need not match otherwise.
+Data structure involves X number of directories including the main directory of files to transcode, as well as an arbitrary number of additional directories with additional data to mux (audio transcoding also supported). All directory content must be lexicographically sortable such that they can be indexed with related file sets. That means that you should create directories that contain only the relevant data files. They don't all have to have identical names, but the names that they do have to be sortable in a relevant manner.
 
 Todo list:
 
