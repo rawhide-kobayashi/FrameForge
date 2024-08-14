@@ -7,7 +7,6 @@ import multiprocessing as mp
 import time
 import re
 import math
-import shlex
 
 def load_config(file_path):
     with open(file_path, 'r') as file:
@@ -44,22 +43,20 @@ class progress_bar(mp.Process):
         super().__init__()
 
 class mux_worker(mp.Process):
-    def __init__(self, preset, out_path, filename, completed_segment_filename_list, additional_content):
+    def __init__(self, preset, out_path, filename, completed_segment_filename_list, additional_content, file_index):
         super().__init__()
         self.preset = preset
         self.out_path = out_path
         self.filename = filename
         self.completed_segment_filename_list = completed_segment_filename_list
         self.additional_content = additional_content
+        self.file_index = file_index
 
     def run(self):
         with open(f"{self.out_path}/{self.preset['name']}/temp/{self.filename}/mux.txt", 'w') as mux:
             for x in self.completed_segment_filename_list:
                 mux.write(f"file '{x}'\n")
 
-        #ffmpeg_concat_string = (f"ffmpeg -f concat -safe -0 -i {self.out_path}/{self.preset['name']}/temp/"
-        #                        f"{self.filename}/mux.txt -c copy {self.out_path}/{self.preset['name']}/temp/"
-        #                        f"{self.filename}/{shlex.quote(self.filename)} -y")
         ffmpeg_concat_string = [
             f"ffmpeg -f concat -safe -0 -i "
             f'"{self.out_path}/{self.preset['name']}/temp/{self.filename}/mux.txt" -c copy '
@@ -70,8 +67,70 @@ class mux_worker(mp.Process):
         stdout, stderr = process.communicate()
         print(stdout, stderr, process.returncode)
         os.remove(f"{self.out_path}/{self.preset['name']}/temp/{self.filename}/mux.txt")
-        for x in self.additional_content:
-            print(x)
+        print(self.file_index)
+        print(self.additional_content)
+
+        mux_video_only = "-A -S -B -T --no-chapters --no-attachments --no-global-tags"
+        mux_audio_only = "-D -S -B -T --no-chapters --no-attachments --no-global-tags"
+        mux_attachments_only = "-A -D -S -B -T --no-chapters --no-global-tags"
+        mux_subtitles_only = "-A -D -B -T --no-chapters --no-attachments --no-global-tags"
+        mux_chapters_only = "-A -D -S -B -T --no-attachments --no-global-tags"
+
+        mkvmerge_mux_string = (f'mkvmerge -v --title "{os.path.splitext(self.filename)[0]}" -o "{self.out_path}/'
+                               f'{self.preset['name']}/{self.filename}" {mux_video_only} --video-tracks 0 "{self.out_path}/{self.preset['name']}/temp/{self.filename}/{self.filename}" ')
+
+        for path in self.additional_content:
+            print(self.additional_content[path])
+            for content_type in self.additional_content[path]:
+                print(self.additional_content[path][content_type])
+                if 'chapters' in self.additional_content[path][content_type]:
+                    print("this shit works [chapters]")
+                    mkvmerge_mux_string += f'{mux_chapters_only} --chapters "{path}{self.additional_content[path]['file_list'][self.file_index]}" '
+
+                if 'attachments' in self.additional_content[path][content_type]:
+                    print("this shit works [attachments]")
+                    mkvmerge_mux_string += f'{mux_attachments_only} --attachments -1:all "{path}{self.additional_content[path]['file_list'][self.file_index]}" '
+
+                if 'audio' in self.additional_content[path][content_type]:
+                    print("this shit works [audio]")
+                    print(self.preset['ffmpeg_audio_string'])
+                    for track_id in self.additional_content[path][content_type]['audio']:
+                        if self.preset['name'] in self.additional_content[path][content_type]['audio'][track_id]['presets']:
+                            print("convert audio here...")
+
+                if 'subtitles' in self.additional_content[path][content_type]:
+                    print("this shit works [subtitles]")
+                    for track_id in self.additional_content[path][content_type]['subtitles']:
+                        if self.preset['name'] in self.additional_content[path][content_type]['subtitles'][track_id]['presets']:
+                            if self.additional_content[path][content_type]['subtitles'][track_id].get('default_flag', False):
+                                if track_id == 'file':
+                                    mkvmerge_mux_string += (f'--default-track-flag 0 ')
+                                else:
+                                    mkvmerge_mux_string += (f'--default-track-flag {track_id} ')
+                            if self.additional_content[path][content_type]['subtitles'][track_id].get('forced', False):
+                                if track_id == 'file':
+                                    mkvmerge_mux_string += (f'--forced-display-flag 0 ')
+                                else:
+                                    mkvmerge_mux_string += (f'--forced-display-flag {track_id} ')
+                            if self.additional_content[path][content_type]['subtitles'][track_id].get('original_language', False):
+                                if track_id == 'file':
+                                    mkvmerge_mux_string += (f'--original-flag 0 ')
+                                else:
+                                    mkvmerge_mux_string += (f'--original-flag {track_id} ')
+                            if track_id == 'file':
+                                mkvmerge_mux_string += (f'--subtitle-tracks '
+                                    f'0 '
+                                    f'--language 0:{self.additional_content[path][content_type]['subtitles'][track_id]['lang']} '
+                                    f'--track-name 0:"{self.additional_content[path][content_type]['subtitles'][track_id]['track_name']}" '
+                                    f'{mux_subtitles_only} "{path}{self.additional_content[path]['file_list'][self.file_index]}" ')
+                            else:
+                                mkvmerge_mux_string += (f'--subtitle-tracks '
+                                    f'{track_id} '
+                                    f'--language {track_id}:{self.additional_content[path][content_type]['subtitles'][track_id]['lang']} '
+                                    f'--track-name {track_id}:"{self.additional_content[path][content_type]['subtitles'][track_id]['track_name']}" '
+                                    f'{mux_subtitles_only} "{path}{self.additional_content[path]['file_list'][self.file_index]}" ')
+
+        print(mkvmerge_mux_string)
         self.close()
 
 class encode_segment:
@@ -130,7 +189,7 @@ class encode_segment:
         return stdout, stderr, process.returncode
 
 class encode_job:
-    def __init__(self, proper_name, input_file, preset, out_path, filename, additional_content):
+    def __init__(self, proper_name, input_file, preset, out_path, filename, additional_content, file_index):
         self.input_file = input_file
         self.proper_name = proper_name
         self.frames_per_segment = 2000
@@ -142,6 +201,7 @@ class encode_job:
         self.segments_completed = 0
         self.completed_segment_filename_list = []
         self.additional_content = additional_content
+        self.file_index = file_index
 
         if not os.path.isdir(f"{self.out_path}/{self.preset['name']}/temp/{self.filename}/"):
             os.makedirs(f"{self.out_path}/{self.preset['name']}/temp/{self.filename}/")
@@ -149,15 +209,11 @@ class encode_job:
     def tally_completed_segments(self, filename):
         self.segments_completed += 1
         self.completed_segment_filename_list.append(filename)
-        print(self.segments_completed)
-        print(self.proper_name)
         if self.segments_completed == self.num_segments:
-            print("do muxing here...")
             self.completed_segment_filename_list = sorted(self.completed_segment_filename_list,
                 key=lambda x: float(re.search(r'/(\d+\.\d+)-', x).group(1)))
-            print(self.completed_segment_filename_list)
             mux = mux_worker(self.preset, self.out_path, self.filename, self.completed_segment_filename_list,
-                             self.additional_content)
+                             self.additional_content, self.file_index)
             mux.start()
 
     def create_segment_encode_list(self):
@@ -249,26 +305,27 @@ def main():
     job_list = []
     worker_list = []
 
-    for file in os.listdir(args.in_path):
+    for path in config['additional_content']:
+        config['additional_content'][path]['file_list'] = sorted(os.listdir(path))
+
+    for x, file in enumerate(sorted(os.listdir(args.in_path)), start=0):
         file_fullpath = os.path.join(args.in_path, file)
         print(file_fullpath)
         for preset in config['presets']:
             print(preset['name'])
             print(preset['ffmpeg_video_string'])
-
             job_list += [encode_job(proper_name=f"{preset['name']}_{file}", input_file=file_fullpath, preset=preset,
-                out_path=args.out_path, filename=file, additional_content=config['additional_content'])]
+                out_path=args.out_path, filename=file, additional_content=config['additional_content'],
+                file_index=x)]
 
     results_queue = mp.Queue()
 
     job_list = sorted(job_list, key=lambda x: x.proper_name)
     job_segment_list = []
     for jobs in job_list:
-        print(jobs.proper_name)
         job_segment_list += jobs.create_segment_encode_list()
 
     for worker in config['nodes']:
-        print(worker['hostname'])
         worker_list += [encode_worker(hostname=worker['hostname'], current_user=current_user,
                         results_queue=results_queue)]
         worker_list[len(worker_list)-1].start()

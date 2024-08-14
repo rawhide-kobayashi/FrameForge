@@ -4,24 +4,63 @@ nodes:
   - hostname: 104.135.233.98
 
 additional_content:
-  - path: '/mnt/content/containing/subtitles/to/mux/'
+  '/mnt/content/containing/subtitles/to/mux/':
     types:
-      - subtitle
-    file_extension: .ass
-  - path: '/mnt/content/containing/subtitles/and/audio/to/mux/'
+      subtitles:
+        file:
+          lang: en
+          default_flag: True
+          track_name: 'good subs'
+          presets:
+            1080p_placebo: True
+            1080p_normal: True
+            720p_cringe: True
+  '/mnt/content/containing/subtitles/and/audio/to/mux/':
     types:
-      - audio
-      - subtitle
-    file_extension: .mkv
-  - path: '/mnt/content/containing/audio/to/mux/'
+      audio:
+        1:
+          lang: en
+          default_flag: True
+          track_name: 'Main'
+          presets:
+            1080p_placebo: True
+            1080p_normal: True
+            720p_cringe: True
+        4:
+          lang: en
+          default_flag: True
+          forced: True
+          track_name: 'BD Signs & Songs'
+          presets:
+            1080p_placebo: True
+            1080p_normal: True
+            720p_cringe: True
+  '/mnt/content/containing/audio/to/mux/':
     types:
-      - audio
-    file_extension: .m2ts
-  - path: '/mnt/content/containing/chapters/and/fonts/to/mux/'
+      audio:
+        1:
+          lang: jpn
+          default_flag: True
+          original_language: True
+          track_name: 'Main'
+          presets:
+            1080p_placebo: True
+            1080p_normal: True
+            720p_cringe: True
+        2:
+          lang: jpn
+          commentary_flag: True
+          original_language: True
+          track_name: 'Commentary'
+          presets:
+            1080p_placebo: True
+            1080p_normal: True
+  '/mnt/content/containing/chapters/to/mux/':
     types:
-      - chapters
-      - attachments
-    file_extension: .mkv
+      chapters: True
+  '/mnt/content/containing/fonts/to/mux/':
+    types:
+      attachments: True
 
 presets:
   - name: 1080p_placebo
