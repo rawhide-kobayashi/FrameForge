@@ -25,7 +25,6 @@ def get_segments_and_framerate(file, frames_per_segment):
         '-show_entries', 'format=duration', file
     ]
     framerate = subprocess.run(framerate_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    print(framerate)
     framerate_num, framerate_denom = map(float, framerate.stdout.strip().split('/'))
     duration_seconds = subprocess.run(duration_seconds_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     duration_seconds = float(duration_seconds.stdout.strip())
@@ -55,20 +54,18 @@ class mux_worker(mp.Process):
     def run(self):
         with open(f"{self.out_path}/{self.preset['name']}/temp/{self.filename}/mux.txt", 'w') as mux:
             for x in self.completed_segment_filename_list:
-                mux.write(f"file '{x}'\n")
+                mux.write(f"file '{x.replace("'", "'\\''")}'\n")
 
-        ffmpeg_concat_string = [
+        ffmpeg_concat_string = (
             f"ffmpeg -f concat -safe -0 -i "
             f'"{self.out_path}/{self.preset['name']}/temp/{self.filename}/mux.txt" -c copy '
             f'"{self.out_path}/{self.preset['name']}/temp/{self.filename}/{self.filename}" -y'
-        ]
+        )
         print(ffmpeg_concat_string)
         process = subprocess.Popen(ffmpeg_concat_string, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
         stdout, stderr = process.communicate()
         print(stdout, stderr, process.returncode)
-        os.remove(f"{self.out_path}/{self.preset['name']}/temp/{self.filename}/mux.txt")
-        print(self.file_index)
-        print(self.additional_content)
+        #os.remove(f"{self.out_path}/{self.preset['name']}/temp/{self.filename}/mux.txt")
 
         mux_video_only = "-A -S -B -T --no-chapters --no-attachments --no-global-tags"
         mux_audio_only = "-D -S -B -T --no-chapters --no-attachments --no-global-tags"
@@ -80,57 +77,55 @@ class mux_worker(mp.Process):
                                f'{self.preset['name']}/{self.filename}" {mux_video_only} --video-tracks 0 "{self.out_path}/{self.preset['name']}/temp/{self.filename}/{self.filename}" ')
 
         for path in self.additional_content:
-            print(self.additional_content[path])
             for content_type in self.additional_content[path]:
-                print(self.additional_content[path][content_type])
                 if 'chapters' in self.additional_content[path][content_type]:
-                    print("this shit works [chapters]")
                     mkvmerge_mux_string += f'{mux_chapters_only} --chapters "{path}{self.additional_content[path]['file_list'][self.file_index]}" '
 
                 if 'attachments' in self.additional_content[path][content_type]:
-                    print("this shit works [attachments]")
                     mkvmerge_mux_string += f'{mux_attachments_only} --attachments -1:all "{path}{self.additional_content[path]['file_list'][self.file_index]}" '
 
                 if 'audio' in self.additional_content[path][content_type]:
-                    print("this shit works [audio]")
-                    print(self.preset['ffmpeg_audio_string'])
                     for track_id in self.additional_content[path][content_type]['audio']:
                         if self.preset['name'] in self.additional_content[path][content_type]['audio'][track_id]['presets']:
-                            print("convert audio here...")
+                            ffmpeg_cmd = (f'ffmpeg -i "{path}{self.additional_content[path]['file_list'][self.file_index]}" '
+                                f'-map 0:{track_id} -map_metadata -{track_id} -map_chapters -{track_id} {self.preset['ffmpeg_audio_string']} '
+                                f'"{self.out_path}/{self.preset['name']}/temp/{self.filename}/audio_{track_id}_{self.filename}" -y'
+                            )
+                            print(ffmpeg_cmd)
+
+                            process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                                       shell=True)
+                            stdout, stderr = process.communicate()
+
+                            if self.additional_content[path][content_type]['audio'][track_id].get('default_flag', False):
+                                mkvmerge_mux_string += (f'--default-track-flag 0 ')
+                            if self.additional_content[path][content_type]['audio'][track_id].get('original_language', False):
+                                mkvmerge_mux_string += (f'--original-flag 0 ')
+
+                            mkvmerge_mux_string += (f'--audio-tracks '
+                                f'0 '
+                                f'--language 0:{self.additional_content[path][content_type]['audio'][track_id]['lang']} '
+                                f'--track-name 0:"{self.additional_content[path][content_type]['audio'][track_id]['track_name']}" '
+                                f'{mux_audio_only} "{self.out_path}/{self.preset['name']}/temp/{self.filename}/audio_{track_id}_{self.filename}" ')
 
                 if 'subtitles' in self.additional_content[path][content_type]:
-                    print("this shit works [subtitles]")
                     for track_id in self.additional_content[path][content_type]['subtitles']:
                         if self.preset['name'] in self.additional_content[path][content_type]['subtitles'][track_id]['presets']:
                             if self.additional_content[path][content_type]['subtitles'][track_id].get('default_flag', False):
-                                if track_id == 'file':
-                                    mkvmerge_mux_string += (f'--default-track-flag 0 ')
-                                else:
-                                    mkvmerge_mux_string += (f'--default-track-flag {track_id} ')
+                                mkvmerge_mux_string += (f'--default-track-flag {track_id} ')
                             if self.additional_content[path][content_type]['subtitles'][track_id].get('forced', False):
-                                if track_id == 'file':
-                                    mkvmerge_mux_string += (f'--forced-display-flag 0 ')
-                                else:
-                                    mkvmerge_mux_string += (f'--forced-display-flag {track_id} ')
+                                mkvmerge_mux_string += (f'--forced-display-flag {track_id} ')
                             if self.additional_content[path][content_type]['subtitles'][track_id].get('original_language', False):
-                                if track_id == 'file':
-                                    mkvmerge_mux_string += (f'--original-flag 0 ')
-                                else:
-                                    mkvmerge_mux_string += (f'--original-flag {track_id} ')
-                            if track_id == 'file':
-                                mkvmerge_mux_string += (f'--subtitle-tracks '
-                                    f'0 '
-                                    f'--language 0:{self.additional_content[path][content_type]['subtitles'][track_id]['lang']} '
-                                    f'--track-name 0:"{self.additional_content[path][content_type]['subtitles'][track_id]['track_name']}" '
-                                    f'{mux_subtitles_only} "{path}{self.additional_content[path]['file_list'][self.file_index]}" ')
-                            else:
-                                mkvmerge_mux_string += (f'--subtitle-tracks '
-                                    f'{track_id} '
-                                    f'--language {track_id}:{self.additional_content[path][content_type]['subtitles'][track_id]['lang']} '
-                                    f'--track-name {track_id}:"{self.additional_content[path][content_type]['subtitles'][track_id]['track_name']}" '
-                                    f'{mux_subtitles_only} "{path}{self.additional_content[path]['file_list'][self.file_index]}" ')
+                                mkvmerge_mux_string += (f'--original-flag {track_id} ')
+                            mkvmerge_mux_string += (f'--subtitle-tracks '
+                                f'{track_id} '
+                                f'--language {track_id}:{self.additional_content[path][content_type]['subtitles'][track_id]['lang']} '
+                                f'--track-name {track_id}:"{self.additional_content[path][content_type]['subtitles'][track_id]['track_name']}" '
+                                f'{mux_subtitles_only} "{path}{self.additional_content[path]['file_list'][self.file_index]}" ')
 
         print(mkvmerge_mux_string)
+        process = subprocess.Popen(mkvmerge_mux_string, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
+        stdout, stderr = process.communicate()
         self.close()
 
 class encode_segment:
@@ -183,7 +178,6 @@ class encode_segment:
             f'\\"{self.file_output_fstring}\\"'
             f'"'
         )
-        print(cmd)
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
         stdout, stderr = process.communicate()
         return stdout, stderr, process.returncode
@@ -310,10 +304,7 @@ def main():
 
     for x, file in enumerate(sorted(os.listdir(args.in_path)), start=0):
         file_fullpath = os.path.join(args.in_path, file)
-        print(file_fullpath)
         for preset in config['presets']:
-            print(preset['name'])
-            print(preset['ffmpeg_video_string'])
             job_list += [encode_job(proper_name=f"{preset['name']}_{file}", input_file=file_fullpath, preset=preset,
                 out_path=args.out_path, filename=file, additional_content=config['additional_content'],
                 file_index=x)]

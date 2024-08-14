@@ -11,3 +11,4 @@ Todo list:
 - Option to specify ffmpeg/mkvtoolnix path
 - Windows support (optional path prefix for each client node)
 - Simple option to blindly mux all additional data from original source file
+- avx512 toggle? on my only compatible platform (7800x3d) there's a minimal if any measurable benefit to turning on avx512 in my test case (x265, 1080p 24fps anime). It's perhaps marginally faster - very low single digit %, within margin of error given other simultaneous desktop use.

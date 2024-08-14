@@ -7,7 +7,7 @@ additional_content:
   '/mnt/content/containing/subtitles/to/mux/':
     types:
       subtitles:
-        file:
+        0:
           lang: en
           default_flag: True
           track_name: 'good subs'
