@@ -89,7 +89,9 @@ class mux_worker(mp.Process):
                         if self.preset['name'] in self.additional_content[path][content_type]['audio'][track_id]['presets']:
                             ffmpeg_cmd = (f'ffmpeg -i "{path}{self.additional_content[path]['file_list'][self.file_index]}" '
                                 f'-map 0:{track_id} -map_metadata -{track_id} -map_chapters -{track_id} {self.preset['ffmpeg_audio_string']} '
-                                f'"{self.out_path}/{self.preset['name']}/temp/{self.filename}/audio_{track_id}_{self.filename}" -y'
+                                f'"{self.out_path}/{self.preset['name']}/temp/{self.filename}/audio_{track_id}_'
+                                f'{self.additional_content[path][content_type]['audio'][track_id]['lang']}_'
+                                f'{self.additional_content[path][content_type]['audio'][track_id]['track_name']}_{self.filename}" -y'
                             )
                             print(ffmpeg_cmd)
 
@@ -98,25 +100,27 @@ class mux_worker(mp.Process):
                             stdout, stderr = process.communicate()
 
                             if self.additional_content[path][content_type]['audio'][track_id].get('default_flag', False):
-                                mkvmerge_mux_string += (f'--default-track-flag 0 ')
+                                mkvmerge_mux_string += f'--default-track-flag 0 '
                             if self.additional_content[path][content_type]['audio'][track_id].get('original_language', False):
-                                mkvmerge_mux_string += (f'--original-flag 0 ')
+                                mkvmerge_mux_string += f'--original-flag 0 '
 
                             mkvmerge_mux_string += (f'--audio-tracks '
                                 f'0 '
                                 f'--language 0:{self.additional_content[path][content_type]['audio'][track_id]['lang']} '
                                 f'--track-name 0:"{self.additional_content[path][content_type]['audio'][track_id]['track_name']}" '
-                                f'{mux_audio_only} "{self.out_path}/{self.preset['name']}/temp/{self.filename}/audio_{track_id}_{self.filename}" ')
+                                f'{mux_audio_only} "{self.out_path}/{self.preset['name']}/temp/{self.filename}/audio_{track_id}_'
+                                f'{self.additional_content[path][content_type]['audio'][track_id]['lang']}_'
+                                f'{self.additional_content[path][content_type]['audio'][track_id]['track_name']}_{self.filename}" ')
 
                 if 'subtitles' in self.additional_content[path][content_type]:
                     for track_id in self.additional_content[path][content_type]['subtitles']:
                         if self.preset['name'] in self.additional_content[path][content_type]['subtitles'][track_id]['presets']:
                             if self.additional_content[path][content_type]['subtitles'][track_id].get('default_flag', False):
-                                mkvmerge_mux_string += (f'--default-track-flag {track_id} ')
+                                mkvmerge_mux_string += f'--default-track-flag {track_id} '
                             if self.additional_content[path][content_type]['subtitles'][track_id].get('forced', False):
-                                mkvmerge_mux_string += (f'--forced-display-flag {track_id} ')
+                                mkvmerge_mux_string += f'--forced-display-flag {track_id} '
                             if self.additional_content[path][content_type]['subtitles'][track_id].get('original_language', False):
-                                mkvmerge_mux_string += (f'--original-flag {track_id} ')
+                                mkvmerge_mux_string += f'--original-flag {track_id} '
                             mkvmerge_mux_string += (f'--subtitle-tracks '
                                 f'{track_id} '
                                 f'--language {track_id}:{self.additional_content[path][content_type]['subtitles'][track_id]['lang']} '
