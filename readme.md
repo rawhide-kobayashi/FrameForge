@@ -1,4 +1,4 @@
-Requires ffmpeg, pyaml, mkvtoolnix. Currently only compatible with unix-like operating systems (WSL should work too, but I haven't tested it yet)
+Requires ffmpeg, pyaml, mkvtoolnix, asciimatics. Currently only compatible with unix-like operating systems (since WSL can mount nfs shares and you can use hyperv bridge networking to easily ssh in, no plans to support windows directly with the current paradigm)
 
 Data structure involves X number of directories including the main directory of files to transcode, as well as an arbitrary number of additional directories with additional data to mux (audio transcoding also supported). All directory content must be lexicographically sortable such that they can be indexed with related file sets. That means that you should create directories that contain only the relevant data files. They don't all have to have identical names, but the names that they do have to be sortable in a relevant manner.
 

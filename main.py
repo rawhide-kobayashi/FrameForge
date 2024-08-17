@@ -7,6 +7,9 @@ import multiprocessing as mp
 import time
 import re
 import math
+from asciimatics.screen import ManagedScreen
+from asciimatics.widgets import Frame, Layout, Label, Text, TextBox, VerticalDivider
+import tqdm
 
 def load_config(file_path):
     with open(file_path, 'r') as file:
@@ -37,9 +40,74 @@ def frame_to_timestamp(frame, framerate):
 def seconds_to_frames(seconds, framerate):
     return round(framerate * seconds)
 
+class marquee:
+    def __init__(self, string):
+        self.string = list(string)
+        self.marquee_scroller = []
+        self.marquee_string = ""
+
+    def reinit(self, marquee_width):
+        self.marquee_scroller = [i - 1 for i in range(marquee_width)]
+    def advance(self):
+        for x in range(len(self.marquee_scroller)):
+            if self.marquee_scroller[x] + 1 < len(self.string):
+                self.marquee_scroller[x] += 1
+            else:
+                self.marquee_scroller[x] = 0
+
+        marquee_string = ""
+        for x in range(len(self.marquee_scroller)):
+            marquee_string += self.string[self.marquee_scroller[x]]
+
+        return marquee_string
+
 class progress_bar(mp.Process):
-    def __init__(self):
+    def __init__(self, worker_list):
         super().__init__()
+        self.worker_list = worker_list
+        os.environ["TERM"] = "xterm-256color"
+
+    @ManagedScreen
+    def run(self, screen=None):
+        worker_stdout_strings = [""] * len(self.worker_list)
+        frame = Frame(screen, screen.height, screen.width, has_border=False, can_scroll=False)
+
+        # Create a single layout with one column per worker
+        layout = Layout(columns=list([12, 1] * len(self.worker_list))[:-1])
+        frame.add_layout(layout)
+
+        hostname_labels = []
+        hostname_marquee = []
+        for x, worker in enumerate(self.worker_list):
+            hostname_marquee.append(marquee(f"<--{worker.hostname}-->"))
+            hostname_marquee[x].reinit(int(screen.width / len(self.worker_list)) - 2)
+            label = Label(hostname_marquee[x].marquee_string)
+            hostname_labels.append(label)
+            layout.add_widget(label, x * 2)
+            if x < len(self.worker_list) - 1:
+                layout.add_widget(VerticalDivider(), (x * 2 + 1))
+
+        # Add labels for each worker
+        labels = []
+        for x in range(len(self.worker_list)):
+            label = Label(worker_stdout_strings[x])
+            labels.append(label)
+            layout.add_widget(label, x * 2)
+
+        frame.fix()
+
+        while True:
+            # Update labels with new output
+            for x, worker in enumerate(self.worker_list):
+                if not worker.stdout_queue.empty():
+                    worker_stdout_strings[x] = worker.stdout_queue.get()
+                    labels[x].text = worker_stdout_strings[x]
+                hostname_labels[x].text = hostname_marquee[x].advance()
+
+            # Refresh the frame
+            frame.update(0)
+            screen.refresh()
+            time.sleep(0.1)
 
 class mux_worker(mp.Process):
     def __init__(self, preset, out_path, filename, completed_segment_filename_list, additional_content, file_index):
@@ -61,10 +129,8 @@ class mux_worker(mp.Process):
             f'"{self.out_path}/{self.preset['name']}/temp/{self.filename}/mux.txt" -c copy '
             f'"{self.out_path}/{self.preset['name']}/temp/{self.filename}/{self.filename}" -y'
         )
-        print(ffmpeg_concat_string)
         process = subprocess.Popen(ffmpeg_concat_string, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, text=True)
         stdout, stderr = process.communicate()
-        print(stdout, stderr, process.returncode)
         #os.remove(f"{self.out_path}/{self.preset['name']}/temp/{self.filename}/mux.txt")
 
         mux_video_only = "-A -S -B -T --no-chapters --no-attachments --no-global-tags"
@@ -93,7 +159,6 @@ class mux_worker(mp.Process):
                                 f'{self.additional_content[path][content_type]['audio'][track_id]['lang']}_'
                                 f'{self.additional_content[path][content_type]['audio'][track_id]['track_name']}_{self.filename}" -y'
                             )
-                            print(ffmpeg_cmd)
 
                             process = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                                        shell=True)
@@ -127,7 +192,6 @@ class mux_worker(mp.Process):
                                 f'--track-name {track_id}:"{self.additional_content[path][content_type]['subtitles'][track_id]['track_name']}" '
                                 f'{mux_subtitles_only} "{path}{self.additional_content[path]['file_list'][self.file_index]}" ')
 
-        print(mkvmerge_mux_string)
         process = subprocess.Popen(mkvmerge_mux_string, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
         stdout, stderr = process.communicate()
         self.close()
@@ -164,17 +228,15 @@ class encode_segment:
                     self.encode_job.tally_completed_segments(self.file_output_fstring)
                     return True
                 else:
-                    print(f"{self.file_output_fstring} wrong duration {duration}")
                     os.remove(self.file_output_fstring)
                     return False
             else:
-                print(f"{self.file_output_fstring} bad returncode {duration.returncode}")
                 os.remove(self.file_output_fstring)
                 return False
         else:
             return False
 
-    def encode(self, hostname, current_user):
+    def encode(self, hostname, current_user, stdout_queue):
         cmd = (
             f'ssh -t {current_user}@{hostname} "ffmpeg -ss {self.segment_start} -to {self.segment_end} -i '
             f'\\"{self.file_fullpath}\\" '
@@ -182,9 +244,17 @@ class encode_segment:
             f'\\"{self.file_output_fstring}\\"'
             f'"'
         )
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
-        stdout, stderr = process.communicate()
-        return stdout, stderr, process.returncode
+        #process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
+        #stdout_queue.put(), stderr = process.communicate()
+        #return stdout, stderr, process.returncode
+
+        with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True) as process:
+            while process.poll() == None:
+                text = process.stdout.readline()
+                stdout_queue.put(text)
+                time.sleep(0.01)
+
+        return process.returncode
 
 class encode_job:
     def __init__(self, proper_name, input_file, preset, out_path, filename, additional_content, file_index):
@@ -230,27 +300,34 @@ class encode_job:
         return segment_list
 
 class encode_worker(mp.Process):
-    def __init__(self, hostname, current_user, results_queue):
+    def __init__(self, hostname, current_user, worker_stdout_queue, worker_stderr_queue, worker_returncode_queue):
         super().__init__()
         self.hostname = hostname
         self.current_user = current_user
         self.current_segment = mp.Manager().Value(typecode=None, value=None)
-        self.results_queue = results_queue
         self.is_running = mp.Value('b', False)
+        self.test_queue = mp.Queue()
+        self.worker_stdout_queue = worker_stdout_queue
+        self.worker_stderr_queue = worker_stderr_queue
+        self.worker_returncode_queue = worker_returncode_queue
+        self.stdout_queue = mp.Queue()
+
+    def return_hostname(self):
+        return self.hostname
 
     def run(self):
         while True:
             if not self.current_segment.value is None and self.is_running.value == True:
-                stdout, stderr, returncode = self.execute_encode(segment_to_encode=self.current_segment.value)
-                self.results_queue.put((self.current_segment.value, returncode, stdout, stderr))
+                returncode = self.execute_encode(segment_to_encode=self.current_segment.value)
+                self.test_queue.put((self.current_segment.value, returncode))
                 self.is_running.value = False
             time.sleep(1)
 
     def execute_encode(self, segment_to_encode):
-        stdout, stderr, returncode = segment_to_encode.encode(self.hostname, self.current_user)
-        return stdout, stderr, returncode
+        returncode = segment_to_encode.encode(self.hostname, self.current_user, stdout_queue = self.stdout_queue)
+        return returncode
 
-def job_handler(segment_list, worker_list, results_queue):
+def job_handler(segment_list, worker_list, worker_stdout_queue, worker_stderr_queue, worker_returncode_queue):
 
     segment_list[:] = [segment for segment in segment_list if not segment.check_if_exists()]
 
@@ -261,20 +338,19 @@ def job_handler(segment_list, worker_list, results_queue):
 
         for worker in worker_list:
             if worker.current_segment.value is None or worker.is_running.value == False:
-                if not results_queue.empty():
-                    results = results_queue.get()
-                    print(results)
-                    for segment in segment_list:
-                        if segment.uuid == results[0].uuid:
-                            segment.encode_job.tally_completed_segments(segment.file_output_fstring)
-                            segment_list.remove(segment)
-                            break
+                if not worker.test_queue.empty():
+                    results = worker.test_queue.get()
+                    if results[1] == 0:
+                        for segment in segment_list:
+                            if segment.uuid == results[0].uuid:
+                                segment.encode_job.tally_completed_segments(segment.file_output_fstring)
+                                segment_list.remove(segment)
+                                break
                     worker.current_segment.value = None
 
                 else:
                     worker.current_segment.value = segment_list[segment_index]
                     worker.is_running.value = True
-                    print(f"Running {segment_list[segment_index]} on {worker.hostname}")
                     segment_list[segment_index].assigned = True
                     segment_index += 1
 
@@ -313,7 +389,9 @@ def main():
                 out_path=args.out_path, filename=file, additional_content=config['additional_content'],
                 file_index=x)]
 
-    results_queue = mp.Queue()
+    worker_stderr_queue = mp.Queue()
+    worker_stdout_queue = mp.Queue()
+    worker_returncode_queue = mp.Queue()
 
     job_list = sorted(job_list, key=lambda x: x.proper_name)
     job_segment_list = []
@@ -322,10 +400,15 @@ def main():
 
     for worker in config['nodes']:
         worker_list += [encode_worker(hostname=worker['hostname'], current_user=current_user,
-                        results_queue=results_queue)]
+            worker_stderr_queue=worker_stderr_queue, worker_stdout_queue=worker_stdout_queue,
+            worker_returncode_queue=worker_returncode_queue)]
         worker_list[len(worker_list)-1].start()
 
-    job_handler(job_segment_list, worker_list, results_queue)
+    progress_bar_worker = progress_bar(worker_list)
+    progress_bar_worker.start()
+
+    job_handler(job_segment_list, worker_list, worker_stderr_queue=worker_stderr_queue,
+        worker_stdout_queue=worker_stdout_queue, worker_returncode_queue=worker_returncode_queue)
 
 if __name__ == "__main__":
     main()
