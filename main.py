@@ -8,7 +8,7 @@ import time
 import re
 import math
 from asciimatics.screen import ManagedScreen
-from asciimatics.widgets import Frame, Layout, Label, Text, TextBox, VerticalDivider
+from asciimatics.widgets import Frame, Layout, Label, Text, TextBox, VerticalDivider, Divider
 import tqdm
 
 def load_config(file_path):
@@ -62,49 +62,84 @@ class marquee:
         return marquee_string
 
 class progress_bar(mp.Process):
-    def __init__(self, worker_list):
+    def __init__(self, worker_list, segment_list):
         super().__init__()
         self.worker_list = worker_list
+        self.segment_list = segment_list
         os.environ["TERM"] = "xterm-256color"
+        self.total_frames = 0
+        self.cumulative_frames = 0
+        self.init_time = time.time()
 
     @ManagedScreen
     def run(self, screen=None):
+        for segment in self.segment_list:
+            self.total_frames += segment.num_frames
+
         worker_stdout_strings = [""] * len(self.worker_list)
         frame = Frame(screen, screen.height, screen.width, has_border=False, can_scroll=False)
 
-        # Create a single layout with one column per worker
-        layout = Layout(columns=list([12, 1] * len(self.worker_list))[:-1])
-        frame.add_layout(layout)
+        layout_header = Layout([1])
+        frame.add_layout(layout_header)
+        total_progress_meter_label = Label(label=tqdm.tqdm.format_meter(n=0, total=self.total_frames, elapsed=time.time() - self.init_time, unit='frames'), align='^')
+        layout_header.add_widget(total_progress_meter_label, column=0)
+        layout_header.add_widget(Divider(line_char='#'), column=0)
+        layout_node_columns = Layout(columns=list([12, 1] * len(self.worker_list))[:-1])
+        frame.add_layout(layout_node_columns)
 
         hostname_labels = []
         hostname_marquee = []
+        worker_cum_values = {}
+        worker_last_values = {}
+        worker_cur_values = {}
+        worker_cur_vals_label = {}
         for x, worker in enumerate(self.worker_list):
             hostname_marquee.append(marquee(f"<--{worker.hostname}-->"))
             hostname_marquee[x].reinit(int(screen.width / len(self.worker_list)) - 2)
             label = Label(hostname_marquee[x].marquee_string)
             hostname_labels.append(label)
-            layout.add_widget(label, x * 2)
+            layout_node_columns.add_widget(label, x * 2)
             if x < len(self.worker_list) - 1:
-                layout.add_widget(VerticalDivider(), (x * 2 + 1))
-
-        # Add labels for each worker
-        labels = []
-        for x in range(len(self.worker_list)):
-            label = Label(worker_stdout_strings[x])
-            labels.append(label)
-            layout.add_widget(label, x * 2)
+                layout_node_columns.add_widget(VerticalDivider(), (x * 2 + 1))
+            worker_cum_values[worker] = {'Frame': 0, 'FPS': 0, '%RT': 0, 'accumulation': 0}
+            worker_last_values[worker] = {'Frame': 0, 'FPS': 0, '%RT': 0}
+            worker_cur_values[worker] = {'Frame': 0, 'FPS': 0, '%RT': 0}
+            worker_cur_vals_label[worker] = {}
+            for stat in worker_cur_values[worker].keys():
+                worker_cur_vals_label[worker][stat] = Label(worker_cur_values[worker][stat])
+                layout_node_columns.add_widget(worker_cur_vals_label[worker][stat], x * 2)
 
         frame.fix()
 
         while True:
-            # Update labels with new output
             for x, worker in enumerate(self.worker_list):
                 if not worker.stdout_queue.empty():
                     worker_stdout_strings[x] = worker.stdout_queue.get()
-                    labels[x].text = worker_stdout_strings[x]
+                    match = re.search(pattern=r'frame=\s*(\d+)\s*fps=\s*([\d\.]+)\s*q=.*?size=\s*([\d\.]+\s*[KMG]i?B)\s*time=.*?bitrate=\s*([\d\.]+kbits/s)\s*speed=\s*([\d\.x]+)', string=worker_stdout_strings[x])
+                    if match:
+                        worker_cur_values[worker]['Frame'] = int(match.group(1))
+                        worker_cur_values[worker]['FPS'] = float(match.group(2))
+                        worker_cur_values[worker]['%RT'] = float(match.group(5)[:-1])
+                        #worker_cur_vals_label[x].text = worker_stdout_strings[x]
+                        for stat in worker_cur_values[worker]:
+                            try:
+                                if stat == 'Frame':
+                                    worker_cur_vals_label[worker][stat].text = f"Frame: {worker_cur_values[worker][stat]}"
+                                    if worker_cur_values[worker][stat] > worker_last_values[worker][stat]:
+                                        self.cumulative_frames += worker_cur_values[worker][stat] - worker_last_values[worker][stat]
+                                    total_progress_meter_label.text = tqdm.tqdm.format_meter(n=self.cumulative_frames, total=self.total_frames,
+                                                                                  elapsed=time.time() - self.init_time,
+                                                                                  unit='frames')
+                                else:
+                                    worker_cur_vals_label[worker][stat].text = f"{stat}: {round((worker_cur_values[worker][stat] + worker_cum_values[worker][stat]) / worker_cum_values[worker]['accumulation'], 3)}"
+
+                            except ZeroDivisionError:
+                                continue
+                            worker_cum_values[worker][stat] += worker_cur_values[worker][stat]
+                            worker_last_values[worker][stat] = worker_cur_values[worker][stat]
+                        worker_cum_values[worker]['accumulation'] += 1
                 hostname_labels[x].text = hostname_marquee[x].advance()
 
-            # Refresh the frame
             frame.update(0)
             screen.refresh()
             time.sleep(0.1)
@@ -254,7 +289,7 @@ class encode_segment:
                 stdout_queue.put(text)
                 time.sleep(0.01)
 
-        return process.returncode
+        return process.returncode, process.stderr.readlines()
 
 class encode_job:
     def __init__(self, proper_name, input_file, preset, out_path, filename, additional_content, file_index):
@@ -307,6 +342,7 @@ class encode_worker(mp.Process):
         self.current_segment = mp.Manager().Value(typecode=None, value=None)
         self.is_running = mp.Value('b', False)
         self.test_queue = mp.Queue()
+        self.error_queue = mp.Queue()
         self.worker_stdout_queue = worker_stdout_queue
         self.worker_stderr_queue = worker_stderr_queue
         self.worker_returncode_queue = worker_returncode_queue
@@ -318,18 +354,21 @@ class encode_worker(mp.Process):
     def run(self):
         while True:
             if not self.current_segment.value is None and self.is_running.value == True:
-                returncode = self.execute_encode(segment_to_encode=self.current_segment.value)
-                self.test_queue.put((self.current_segment.value, returncode))
+                returncode, stderr = self.execute_encode(segment_to_encode=self.current_segment.value)
+                self.test_queue.put((self.current_segment.value, returncode, stderr))
                 self.is_running.value = False
             time.sleep(1)
 
     def execute_encode(self, segment_to_encode):
-        returncode = segment_to_encode.encode(self.hostname, self.current_user, stdout_queue = self.stdout_queue)
-        return returncode
+        returncode, stderr = segment_to_encode.encode(self.hostname, self.current_user, stdout_queue = self.stdout_queue)
+        return returncode, stderr
 
 def job_handler(segment_list, worker_list, worker_stdout_queue, worker_stderr_queue, worker_returncode_queue):
 
     segment_list[:] = [segment for segment in segment_list if not segment.check_if_exists()]
+
+    progress_bar_worker = progress_bar(worker_list, segment_list)
+    progress_bar_worker.start()
 
     segment_index = 0
     while len(segment_list) > 0:
@@ -346,6 +385,9 @@ def job_handler(segment_list, worker_list, worker_stdout_queue, worker_stderr_qu
                                 segment.encode_job.tally_completed_segments(segment.file_output_fstring)
                                 segment_list.remove(segment)
                                 break
+                    else:
+                        worker.error_queue.put(results)
+
                     worker.current_segment.value = None
 
                 else:
@@ -403,9 +445,6 @@ def main():
             worker_stderr_queue=worker_stderr_queue, worker_stdout_queue=worker_stdout_queue,
             worker_returncode_queue=worker_returncode_queue)]
         worker_list[len(worker_list)-1].start()
-
-    progress_bar_worker = progress_bar(worker_list)
-    progress_bar_worker.start()
 
     job_handler(job_segment_list, worker_list, worker_stderr_queue=worker_stderr_queue,
         worker_stdout_queue=worker_stdout_queue, worker_returncode_queue=worker_returncode_queue)
