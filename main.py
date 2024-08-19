@@ -10,6 +10,7 @@ import math
 from asciimatics.screen import ManagedScreen
 from asciimatics.widgets import Frame, Layout, Label, Text, TextBox, VerticalDivider, Divider
 import tqdm
+import select
 
 def load_config(file_path):
     with open(file_path, 'r') as file:
@@ -93,6 +94,8 @@ class progress_bar(mp.Process):
         worker_last_values = {}
         worker_cur_values = {}
         worker_cur_vals_label = {}
+        worker_status_header = {}
+        worker_status_stderr = {}
         for x, worker in enumerate(self.worker_list):
             hostname_marquee.append(marquee(f"<--{worker.hostname}-->"))
             hostname_marquee[x].reinit(int(screen.width / len(self.worker_list)) - 2)
@@ -108,6 +111,12 @@ class progress_bar(mp.Process):
             for stat in worker_cur_values[worker].keys():
                 worker_cur_vals_label[worker][stat] = Label(worker_cur_values[worker][stat])
                 layout_node_columns.add_widget(worker_cur_vals_label[worker][stat], x * 2)
+            worker_status_header[worker] = Label("Status: Waiting...")
+            layout_node_columns.add_widget(worker_status_header[worker], x * 2)
+            worker_status_stderr[worker] = TextBox(height=10, line_wrap=True, as_string=True, readonly=True)
+            worker_status_stderr[worker].disabled = True
+            worker_status_stderr[worker].value = ""
+            layout_node_columns.add_widget(worker_status_stderr[worker], x * 2)
 
         frame.fix()
 
@@ -117,6 +126,8 @@ class progress_bar(mp.Process):
                     worker_stdout_strings[x] = worker.stdout_queue.get()
                     match = re.search(pattern=r'frame=\s*(\d+)\s*fps=\s*([\d\.]+)\s*q=.*?size=\s*([\d\.]+\s*[KMG]i?B)\s*time=.*?bitrate=\s*([\d\.]+kbits/s)\s*speed=\s*([\d\.x]+)', string=worker_stdout_strings[x])
                     if match:
+                        worker_status_header[worker].text = "Status: OK"
+                        worker_status_stderr[worker].value = ""
                         worker_cur_values[worker]['Frame'] = int(match.group(1))
                         worker_cur_values[worker]['FPS'] = float(match.group(2))
                         worker_cur_values[worker]['%RT'] = float(match.group(5)[:-1])
@@ -138,6 +149,10 @@ class progress_bar(mp.Process):
                             worker_cum_values[worker][stat] += worker_cur_values[worker][stat]
                             worker_last_values[worker][stat] = worker_cur_values[worker][stat]
                         worker_cum_values[worker]['accumulation'] += 1
+                if not worker.stderr_queue.empty():
+                    worker_stderr_strings = worker.stderr_queue.get()
+                    worker_status_header[worker].text = "Status: BAD!"
+                    worker_status_stderr[worker].value = f"Return code {worker_stderr_strings[1]}, stderr: {worker_stderr_strings[2]}"
                 hostname_labels[x].text = hostname_marquee[x].advance()
 
             frame.update(0)
@@ -282,14 +297,17 @@ class encode_segment:
         #process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True)
         #stdout_queue.put(), stderr = process.communicate()
         #return stdout, stderr, process.returncode
-
+        stderr = ""
         with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True) as process:
             while process.poll() == None:
-                text = process.stdout.readline()
-                stdout_queue.put(text)
+                stdout = process.stdout.readline()
+                stdout_queue.put(stdout)
+                err = select.select([process.stderr], [], [], 0.01)[0]
+                if err:
+                    stderr = process.stderr.read()
                 time.sleep(0.01)
 
-        return process.returncode, process.stderr.readlines()
+        return process.returncode, stderr
 
 class encode_job:
     def __init__(self, proper_name, input_file, preset, out_path, filename, additional_content, file_index):
@@ -342,7 +360,7 @@ class encode_worker(mp.Process):
         self.current_segment = mp.Manager().Value(typecode=None, value=None)
         self.is_running = mp.Value('b', False)
         self.test_queue = mp.Queue()
-        self.error_queue = mp.Queue()
+        self.stderr_queue = mp.Queue()
         self.worker_stdout_queue = worker_stdout_queue
         self.worker_stderr_queue = worker_stderr_queue
         self.worker_returncode_queue = worker_returncode_queue
@@ -386,7 +404,10 @@ def job_handler(segment_list, worker_list, worker_stdout_queue, worker_stderr_qu
                                 segment_list.remove(segment)
                                 break
                     else:
-                        worker.error_queue.put(results)
+                        worker.stderr_queue.put(results)
+                        for segment in segment_list:
+                            if segment.uuid == results[0].uuid:
+                                segment.assigned = False
 
                     worker.current_segment.value = None
 
