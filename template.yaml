@@ -64,11 +64,11 @@ additional_content:
 
 presets:
   - name: 1080p_placebo
-    ffmpeg_video_string: '-c:v libx265 -preset placebo -tune animation -pix_fmt yuv444p10 -profile:v main444-10 -x265-params "bframes=16:psy-rd=2:psy-rdoq=4:aq-mode=4:qcomp=0.8:limit-sao=1:no-strong-intra-smoothing=1:deblock=-1,-1:ref=6:pmode=1" -crf 12 -y'
-    ffmpeg_audio_string: '-vn -c:v copy -async 1'
+    ffmpeg_video_string: '-c:v libx265 -preset placebo -tune animation -pix_fmt yuv444p10 -profile:v main444-10 -x265-params "bframes=16:psy-rd=1.6:psy-rdoq=4:aq-mode=4:qcomp=0.8:no-sao=1:no-strong-intra-smoothing=1:deblock=-1,-1:ref=6:pmode=1:mcstf=1" -crf 12 -y'
+    ffmpeg_audio_string: '-vn -sn -dn -c:v copy -async 1'
   - name: 1080p_normal
-    ffmpeg_video_string: '-c:v libx265 -preset placebo -tune animation -pix_fmt yuv420p10 -profile:v main10 -x265-params "bframes=16:psy-rd=2:psy-rdoq=4:aq-mode=4:qcomp=0.8:ref=6:pmode=1" -crf 18 -y'
-    ffmpeg_audio_string: '-vn -c:a libopus -b:a 192k -async 1'
+    ffmpeg_video_string: '-c:v libx265 -preset placebo -tune animation -pix_fmt yuv420p10 -profile:v main10 -x265-params "bframes=16:psy-rd=1.2:psy-rdoq=2:aq-mode=4:qcomp=0.8:limit-sao=1:deblock=-1,-1:ref=6:pmode=1:mcstf=1" -crf 18 -y'
+    ffmpeg_audio_string: '-vn -sn -dn -c:a libopus -b:a 192k -async 1'
   - name: 720p_cringe
-    ffmpeg_video_string: '-c:v libx265 -preset placebo -tune animation -pix_fmt yuv420p10 -profile:v main10 -x265-params "bframes=16:psy-rd=2:psy-rdoq=4:aq-mode=4:qcomp=0.8:ref=6:pmode=1" -vf scale=1280:720 -sws_flags spline -crf 24 -y'
-    ffmpeg_audio_string: '-vn -c:a libopus -b:a 128k -async 1'
+    ffmpeg_video_string: '-c:v libx265 -preset placebo -tune animation -pix_fmt yuv420p10 -profile:v main10 -x265-params "bframes=16:psy-rd=1:psy-rdoq=1:aq-mode=4:qcomp=0.8:ref=6:pmode=1:mcstf=1" -vf scale=1280:720 -sws_flags spline -crf 24 -y'
+    ffmpeg_audio_string: '-vn -sn -dn -c:a libopus -b:a 128k -async 1'

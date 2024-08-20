@@ -162,7 +162,6 @@ class progress_bar(mp.Process):
                 while not self.mux_info_queue.empty():
                     current_mux_info_label.text = str(self.mux_info_queue.get())
 
-            frame.fix()
             frame.update(0)
             screen.refresh()
             time.sleep(0.1)
