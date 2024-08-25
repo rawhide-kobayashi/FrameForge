@@ -189,6 +189,7 @@ class rich_helper():
         self.worker_cur_values = {}
         self.worker_status_header = {}
         self.worker_status_stderr = {}
+        self.mux_strings_list = [""] * 8
 
         for worker in self.worker_list:
             self.worker_cum_values[worker] = {'Frame': 0, 'FPS': 0.0, '%RT': 0.0, 'accumulation': 0}
@@ -201,6 +202,23 @@ class rich_helper():
 
         worker_stdout_strings = [""] * len(self.worker_list)
 
+    def update_mux_info(self, mux_info_queue):
+        mux_text = ""
+        new_mux_string = mux_info_queue.get()
+        if self.mux_strings_list[7].startswith("Final Mux") and new_mux_string.startswith("Final Mux"):
+            self.mux_strings_list[7] = new_mux_string
+        else:
+            self.mux_strings_list.append(new_mux_string)
+        if len(self.mux_strings_list) > 8:
+            self.mux_strings_list.pop(0)
+
+        for x in range(len(self.mux_strings_list)):
+            mux_text += self.mux_strings_list[x]
+            mux_text += "\n"
+
+        return mux_text
+
+
     def create_node_table(self):
         table = Table(title=tqdm.tqdm.format_meter(n=self.cumulative_frames, total=self.total_frames, elapsed=time.time() - self.init_time,
                                                    unit='frames'))
@@ -211,7 +229,7 @@ class rich_helper():
         table.add_column(header="Avg %RT", min_width=7)
 
         for worker in self.worker_list:
-            table.add_row(worker.hostname, self.worker_cur_values[worker]['Status'], str(self.worker_cur_values[worker]['Frame']),
+            table.add_row(worker.hostname, self.worker_cur_values[worker]['Status'], str(self.worker_cum_values[worker]['Frame']),
                           str(self.worker_avg_values[worker]['FPS']), f"{self.worker_avg_values[worker]['%RT']}x")
 
         return table
@@ -384,7 +402,7 @@ class mux_worker(mp.Process):
         with subprocess.Popen(mkvmerge_mux_string, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True) as process:
             while process.poll() is None:
                 stdout = process.stdout.readline()
-                self.mux_info_queue.put(f"Final mux: {stdout.strip()}")
+                self.mux_info_queue.put(f"Final Mux: {stdout.strip()}")
                 err = select.select([process.stderr], [], [], 0.01)[0]
                 if err:
                     stderr = process.stderr.read()
@@ -575,17 +593,19 @@ class encode_worker(mp.Process):
         self.test_queue = mp.Queue()
         self.stderr_queue = mp.Queue()
         self.stdout_queue = mp.Queue()
+        self.shutdown = mp.Value('b', False)
 
     def return_hostname(self):
         return self.hostname
 
     def run(self):
-        while True:
+        while not self.shutdown.value:
             if not self.current_segment.value is None and self.is_running.value == True:
                 returncode, stderr = self.execute_encode(segment_to_encode=self.current_segment.value)
                 self.test_queue.put((self.current_segment.value, returncode, stderr))
                 self.is_running.value = False
             time.sleep(1)
+        self.close()
 
     def execute_encode(self, segment_to_encode):
         returncode, stderr = segment_to_encode.encode(self.hostname, self.current_user, stdout_queue = self.stdout_queue)
@@ -600,13 +620,17 @@ def job_handler(segment_list, worker_list):
     tui = rich_helper(worker_list, segment_list, mux_info_queue)
     layout = Layout()
     #layout.split_column(Layout(name="header", size=4), Layout(name="table"), Layout(name="footer", size=8))
-    layout.split_column(Layout(name="table"))
+    layout.split_column(Layout(name="table"), Layout(name="footer", size=10))
+    layout['footer'].split_row(Layout(name="stderr"), Layout(name="Mux Info"))
     layout['table'].update(tui.create_node_table())
 
+    layout['footer']['Mux Info'].update(Panel("Nothing here yet.", title="Mux Info"))
+
     segment_index = 0
+    mux_string_arr = []
     with Live(layout, refresh_per_second=1, screen=True):
         while len(segment_list) > 0:
-            while segment_list[segment_index].assigned:
+            while segment_list[segment_index].assigned and segment_index + 1 < len(segment_list):
                 segment_index += 1
             for worker in worker_list:
                 if worker.current_segment.value is None or worker.is_running.value == False:
@@ -617,6 +641,7 @@ def job_handler(segment_list, worker_list):
                                 if segment.uuid == results[0].uuid:
                                     segment.encode_job.tally_completed_segments(segment.file_output_fstring, mux_info_queue)
                                     segment_list.remove(segment)
+                                    tui.worker_cur_values[worker]['Status'] = "Idle"
                                     break
                         else:
                             worker.stderr_queue.put(results)
@@ -625,18 +650,33 @@ def job_handler(segment_list, worker_list):
                                     segment.assigned = False
                         worker.current_segment.value = None
                     else:
-                        worker.current_segment.value = segment_list[segment_index]
-                        worker.is_running.value = True
-                        segment_list[segment_index].assigned = True
-                        segment_index += 1
+                        try:
+                            if not segment_list[segment_index].assigned:
+                                worker.current_segment.value = segment_list[segment_index]
+                                worker.is_running.value = True
+                                segment_list[segment_index].assigned = True
+                                segment_index += 1
+                        except IndexError:
+                            continue
                 elif not worker.stdout_queue.empty():
                     tui.update_worker_status(worker, worker.stdout_queue.get())
             segment_index = 0
             layout['table'].update(tui.create_node_table())
+            if not mux_info_queue.empty():
+                layout['footer']['Mux Info'].update(Panel(tui.update_mux_info(mux_info_queue), title="Mux Info"))
             time.sleep(0.01)
 
+    for worker in worker_list:
+        worker.shutdown.value = True
+        worker.join()
 
+    mux_workers = [x for x in mp.active_children() if x.name.startswith('mux_worker')]
 
+    for mux in mux_workers:
+        while mux.is_alive():
+            if not mux_info_queue.empty():
+                print(mux_info_queue.get())
+            time.sleep(0.01)
 
 def main():
     current_user = os.getlogin()
