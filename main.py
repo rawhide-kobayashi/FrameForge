@@ -1,5 +1,3 @@
-import socket
-
 import yaml
 import argparse
 import os
@@ -17,6 +15,7 @@ from rich.layout import Layout
 from rich.panel import Panel
 from rich import print
 import paramiko
+from datetime import datetime
 
 def load_config(file_path):
     with open(file_path, 'r') as file:
@@ -68,113 +67,6 @@ class marquee:
 
         return marquee_string
 
-#I hate this so much
-'''
-class progress_bar(mp.Process):
-    def __init__(self, worker_list, segment_list, mux_info_queue):
-        super().__init__()
-        self.worker_list = worker_list
-        self.segment_list = segment_list
-        os.environ["TERM"] = "xterm-256color"
-        self.total_frames = 0
-        self.cumulative_frames = 0
-        self.init_time = time.time()
-        self.mux_info_queue = mux_info_queue
-
-    @ManagedScreen
-    def run(self, screen=None):
-        for segment in self.segment_list:
-            self.total_frames += segment.num_frames
-
-        worker_stdout_strings = [""] * len(self.worker_list)
-        frame = Frame(screen, screen.height, screen.width, has_border=False, can_scroll=False)
-
-        layout_header = Layout([1])
-        frame.add_layout(layout_header)
-        total_progress_meter_label = Label(label=tqdm.tqdm.format_meter(n=0, total=self.total_frames, elapsed=time.time() - self.init_time, unit='frames'), align='^')
-        layout_header.add_widget(total_progress_meter_label, column=0)
-        current_mux_info_label = Label(label="Mux status: Waiting...")
-        layout_header.add_widget(current_mux_info_label, column=0)
-        layout_header.add_widget(Divider(line_char='#'), column=0)
-        layout_node_columns = Layout(columns=list([12, 1] * len(self.worker_list))[:-1])
-        frame.add_layout(layout_node_columns)
-
-        hostname_labels = []
-        hostname_marquee = []
-        worker_cum_values = {}
-        worker_last_values = {}
-        worker_cur_values = {}
-        worker_cur_vals_label = {}
-        worker_status_header = {}
-        worker_status_stderr = {}
-        for x, worker in enumerate(self.worker_list):
-            hostname_marquee.append(marquee(f"<--{worker.hostname}-->"))
-            hostname_marquee[x].reinit(int(screen.width / len(self.worker_list)) - 2)
-            label = Label(hostname_marquee[x].marquee_string)
-            hostname_labels.append(label)
-            layout_node_columns.add_widget(label, x * 2)
-            if x < len(self.worker_list) - 1:
-                layout_node_columns.add_widget(VerticalDivider(), (x * 2 + 1))
-            worker_cum_values[worker] = {'Frame': 0, 'FPS': 0.0, '%RT': 0.0, 'accumulation': 0}
-            worker_last_values[worker] = {'Frame': 0, 'FPS': 0.0, '%RT': 0.0}
-            worker_cur_values[worker] = {'Frame': 0, 'FPS': 0.0, '%RT': 0.0}
-            worker_cur_vals_label[worker] = {}
-            for stat in worker_cur_values[worker].keys():
-                worker_cur_vals_label[worker][stat] = Label(worker_cur_values[worker][stat])
-                layout_node_columns.add_widget(worker_cur_vals_label[worker][stat], x * 2)
-            worker_status_header[worker] = Label("Status: Waiting...")
-            layout_node_columns.add_widget(worker_status_header[worker], x * 2)
-            worker_status_stderr[worker] = TextBox(height=10, line_wrap=True, as_string=True, readonly=True)
-            worker_status_stderr[worker].disabled = True
-            worker_status_stderr[worker].value = ""
-            layout_node_columns.add_widget(worker_status_stderr[worker], x * 2)
-
-        frame.fix()
-
-        while True:
-            for x, worker in enumerate(self.worker_list):
-                if not worker.stdout_queue.empty():
-                    worker_stdout_strings[x] = worker.stdout_queue.get()
-                    match = re.search(pattern=r'frame=\s*(\d+)\s*fps=\s*([\d\.]+)\s*q=.*?size=\s*([\d\.]+\s*[KMG]i?B)\s*time=.*?bitrate=\s*([\d\.]+kbits/s)\s*speed=\s*([\d\.x]+)', string=worker_stdout_strings[x])
-                    if match:
-                        worker_status_header[worker].text = "Status: OK"
-                        worker_status_stderr[worker].value = ""
-                        worker_cur_values[worker]['Frame'] = int(match.group(1))
-                        worker_cur_values[worker]['FPS'] = float(match.group(2))
-                        worker_cur_values[worker]['%RT'] = float(match.group(5)[:-1])
-                        for stat in worker_cur_values[worker]:
-                            try:
-                                if stat == 'Frame':
-                                    if worker_cur_values[worker][stat] != worker_last_values[worker][stat]:
-                                        worker_cur_vals_label[worker][stat].text = f"Frame: {worker_cur_values[worker][stat]}"
-                                        if worker_cur_values[worker][stat] > worker_last_values[worker][stat]:
-                                            self.cumulative_frames += worker_cur_values[worker][stat] - worker_last_values[worker][stat]
-                                        total_progress_meter_label.text = tqdm.tqdm.format_meter(n=self.cumulative_frames, total=self.total_frames,
-                                                                                      elapsed=time.time() - self.init_time,
-                                                                                      unit='frames')
-                                else:
-                                    worker_cur_vals_label[worker][stat].text = f"{stat}: {round((worker_cur_values[worker][stat] + worker_cum_values[worker][stat]) / worker_cum_values[worker]['accumulation'], 3)}"
-
-                            except ZeroDivisionError:
-                                continue
-                            worker_cum_values[worker][stat] += worker_cur_values[worker][stat]
-                            worker_last_values[worker][stat] = worker_cur_values[worker][stat]
-                        worker_cum_values[worker]['accumulation'] += 1
-                if not worker.stderr_queue.empty():
-                    worker_stderr_strings = worker.stderr_queue.get()
-                    worker_status_header[worker].text = "Status: BAD!"
-                    worker_status_stderr[worker].value = f"Code {worker_stderr_strings[1]}, {worker_stderr_strings[2]}"
-                hostname_labels[x].text = hostname_marquee[x].advance()
-
-            if not self.mux_info_queue.empty():
-                while not self.mux_info_queue.empty():
-                    current_mux_info_label.text = str(self.mux_info_queue.get())
-
-            frame.update(0)
-            screen.refresh()
-            time.sleep(0.1)
-'''
-
 class rich_helper():
     def __init__(self, worker_list, segment_list, mux_info_queue):
         self.worker_list = worker_list
@@ -190,6 +82,7 @@ class rich_helper():
         self.worker_status_header = {}
         self.worker_status_stderr = {}
         self.mux_strings_list = [""] * 8
+        self.stderr_strings_list = [""] * 8
 
         for worker in self.worker_list:
             self.worker_cum_values[worker] = {'Frame': 0, 'FPS': 0.0, '%RT': 0.0, 'accumulation': 0}
@@ -201,6 +94,19 @@ class rich_helper():
             self.total_frames += segment.num_frames
 
         worker_stdout_strings = [""] * len(self.worker_list)
+
+    def update_stderr(self, hostname, stderr):
+        stderr_text = ""
+        self.stderr_strings_list.append(f"{datetime.now().strftime('%H:%M:%S')} {hostname}: {str(stderr[2]).splitlines()[-1]}")
+
+        if len(self.stderr_strings_list) > 8:
+            self.stderr_strings_list.pop(0)
+
+        for x in range(len(self.stderr_strings_list)):
+            stderr_text += self.stderr_strings_list[x]
+            stderr_text += "\n"
+
+        return stderr_text
 
     def update_mux_info(self, mux_info_queue):
         mux_text = ""
@@ -262,33 +168,6 @@ class rich_helper():
 
         elif re.search(pattern=r'Press \[q\] to stop, \[\?\] for help', string=status):
             self.worker_cur_values[worker]['Status'] = "Seek"
-
-        #elif not worker.stderr_queue.empty():
-        #    worker_stderr_strings = worker.stderr_queue.get()
-        #    worker_status_header[worker].text = "Status: BAD!"
-        #    worker_status_stderr[worker].value = f"Code {worker_stderr_strings[1]}, {worker_stderr_strings[2]}"
-        #hostname_labels[x].text = hostname_marquee[x].advance()
-
-    #    layout_header.add_widget(total_progress_meter_label, column=0)
-    #    current_mux_info_label = Label(label="Mux status: Waiting...")
-    #    layout_header.add_widget(current_mux_info_label, column=0)
-    #    layout_header.add_widget(Divider(line_char='#'), column=0)
-    #    layout_node_columns = Layout(columns=list([12, 1] * len(self.worker_list))[:-1])
-    #    frame.add_layout(layout_node_columns)
-
-
-
-        #with Live(layout) as live:
-            #while True:
-                #for x, worker in enumerate(self.worker_list):
-                #    if not worker.stdout_queue.empty():
-                #        worker_stdout_strings[x] = worker.stdout_queue.get()
-
-
-                #if not self.mux_info_queue.empty():
-                #    while not self.mux_info_queue.empty():
-                #        current_mux_info_label.text = str(self.mux_info_queue.get())
-
 
 class mux_worker(mp.Process):
     def __init__(self, preset, out_path, filename, completed_segment_filename_list, additional_content, file_index, mux_info_queue):
@@ -456,34 +335,6 @@ class encode_segment:
         else:
             return False
 
-    #def encode(self, hostname, current_user, stdout_queue):
-    #    cmd = (
-    #        f'ssh -o ServerAliveInterval=10 -t {current_user}@{hostname} "ffmpeg -ss {self.segment_start} -to {self.segment_end} -i '
-    #        f'\\"{self.file_fullpath}\\" '
-    #        f"{self.ffmpeg_video_string} "
-    #        f'\\"{self.file_output_fstring}\\"'
-    #        f'"'
-    #    )
-    #    stderr = ""
-    #    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True) as process:
-    #        while process.poll() is None:
-    #            try:
-    #                stdout = process.stdout.readline()
-    #                stdout_queue.put(stdout)
-    #                err = select.select([process.stderr], [], [], 0.01)[0]
-    #                if err:
-    #                    stderr = process.stderr.read()
-    #                time.sleep(0.01)
-#
-    #            #manually kill the process because running ssh -t above interferes with rich tui
-    #            except KeyboardInterrupt:
-    #                kill_cmd = (
-    #                    f'ssh {current_user}@{hostname} "pkill -9 -f \\"{self.file_output_fstring}\\""'
-    #                )
-    #                subprocess.run(kill_cmd, shell=True)
-#
-    #    return process.returncode, stderr
-
     def encode(self, hostname, current_user, stdout_queue):
         cmd = (
             f'ffmpeg -ss {self.segment_start} -to {self.segment_end} -i '
@@ -492,34 +343,47 @@ class encode_segment:
             f'\"{self.file_output_fstring}\"'
         )
 
+        return_code, stderr = execute_cmd_ssh(cmd, hostname, current_user, stdout_queue, get_pty=True)
 
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        try:
-            client.connect(hostname=hostname, username=current_user, key_filename=f"/home/{current_user}/.ssh/id_rsa.pub")
-        except Exception as e:
-            return -1, e
+        #paramiko can only get ffmpeg stdout with get_pty=True... But it can only get stderr with get_pty=False...
 
-        stdin, stdout, stderr = client.exec_command(cmd, get_pty=True)
-        try:
-            line = b''
-            while not stdout.channel.exit_status_ready():
-                for byte in iter(lambda: stdout.read(1), b""):
-                    line += byte
-                    if byte == b'\n' or byte == b'\r':
-                        stdout_queue.put(line.decode('utf-8', errors='replace').rstrip())
-                        line = b''
+        if not return_code == 0:
+            return_code, stderr = execute_cmd_ssh(cmd, hostname, current_user, stdout_queue, get_pty=False)
 
-        except KeyboardInterrupt:
-            kill_cmd = (
-                f'pkill -9 -f \"{self.file_output_fstring}\"'
-            )
-            client.exec_command(kill_cmd)
-            client.close()
+        return return_code, stderr
 
+def execute_cmd_ssh(cmd, hostname, username, stdout_queue, get_pty):
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    try:
+        client.connect(hostname=hostname, username=username, key_filename=f"/home/{username}/.ssh/id_rsa.pub")
+
+    except Exception as e:
+        client.close()
+        return -1, e
+
+    client.invoke_shell()
+    stdin, stdout, stderr = client.exec_command(cmd, get_pty=get_pty)
+    try:
+        line = b''
+        while not stdout.channel.exit_status_ready():
+            for byte in iter(lambda: stdout.read(1), b""):
+                line += byte
+                if byte == b'\n' or byte == b'\r':
+                    stdout_queue.put(line.decode('utf-8', errors='replace').rstrip())
+                    line = b''
+    except KeyboardInterrupt:
+        kill_cmd = (
+            f'pkill -9 -f {cmd}'
+        )
+        client.exec_command(kill_cmd)
         client.close()
 
-        return stdout.channel.recv_exit_status(), str(stderr)
+    client.close()
+    return stdout.channel.recv_exit_status(), stderr.read().decode('utf-8')
+
+
 
 class encode_job:
     def __init__(self, proper_name, input_file, preset, out_path, filename, additional_content, file_index):
@@ -548,9 +412,12 @@ class encode_job:
         if os.path.isfile(f"{self.out_path}/{self.preset['name']}/{self.filename}"):
             duration = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             if duration.returncode == 0:
-                duration = round(float(duration.stdout.strip()), 3)
-                if seconds_to_frames(duration, self.framerate) == self.frames_total:
-                    return True
+                if not duration.stdout.strip() == "N/A":
+                    duration = round(float(duration.stdout.strip()), 3)
+                    if seconds_to_frames(duration, self.framerate) == self.frames_total:
+                        return True
+                    else:
+                        return False
                 else:
                     return False
             else:
@@ -590,25 +457,32 @@ class encode_worker(mp.Process):
         self.current_user = current_user
         self.current_segment = mp.Manager().Value(typecode=None, value=None)
         self.is_running = mp.Value('b', False)
-        self.test_queue = mp.Queue()
         self.stderr_queue = mp.Queue()
         self.stdout_queue = mp.Queue()
         self.shutdown = mp.Value('b', False)
+        self.err_cooldown = mp.Value('b', False)
+        self.err_timestamp = 0
 
     def return_hostname(self):
         return self.hostname
 
     def run(self):
         while not self.shutdown.value:
+            if time.time() - self.err_timestamp > 30:
+                self.err_cooldown.value = False
+
             if not self.current_segment.value is None and self.is_running.value == True:
                 returncode, stderr = self.execute_encode(segment_to_encode=self.current_segment.value)
-                self.test_queue.put((self.current_segment.value, returncode, stderr))
+                self.stderr_queue.put((self.current_segment.value, returncode, stderr))
                 self.is_running.value = False
+
             time.sleep(1)
         self.close()
 
     def execute_encode(self, segment_to_encode):
         returncode, stderr = segment_to_encode.encode(self.hostname, self.current_user, stdout_queue = self.stdout_queue)
+        if not returncode == 0:
+            self.err_timestamp = time.time()
         return returncode, stderr
 
 def job_handler(segment_list, worker_list):
@@ -633,9 +507,9 @@ def job_handler(segment_list, worker_list):
             while segment_list[segment_index].assigned and segment_index + 1 < len(segment_list):
                 segment_index += 1
             for worker in worker_list:
-                if worker.current_segment.value is None or worker.is_running.value == False:
-                    if not worker.test_queue.empty():
-                        results = worker.test_queue.get()
+                if (worker.current_segment.value is None or worker.is_running.value == False) and not worker.err_cooldown.value:
+                    if not worker.stderr_queue.empty():
+                        results = worker.stderr_queue.get()
                         if results[1] == 0:
                             for segment in segment_list:
                                 if segment.uuid == results[0].uuid:
@@ -644,10 +518,12 @@ def job_handler(segment_list, worker_list):
                                     tui.worker_cur_values[worker]['Status'] = "Idle"
                                     break
                         else:
-                            worker.stderr_queue.put(results)
                             for segment in segment_list:
                                 if segment.uuid == results[0].uuid:
                                     segment.assigned = False
+                                    worker.err_cooldown.value = True
+                            layout['footer']['stderr'].update(Panel(tui.update_stderr(worker.hostname, results), title="stderr"))
+                            tui.worker_cur_values[worker]['Status'] = "Error"
                         worker.current_segment.value = None
                     else:
                         try:

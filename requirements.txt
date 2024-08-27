@@ -1,3 +1,4 @@
 PyYAML
 tqdm
 rich
+paramiko
