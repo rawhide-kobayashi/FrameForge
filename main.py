@@ -111,10 +111,14 @@ class rich_helper():
     def update_mux_info(self, mux_info_queue):
         mux_text = ""
         new_mux_string = mux_info_queue.get()
-        if self.mux_strings_list[7].startswith("Final Mux") and new_mux_string.startswith("Final Mux"):
+        new_mux_prefix = new_mux_string.split(':')[0]
+        #print(new_mux_prefix)
+        #print(self.mux_strings_list[7])
+        if self.mux_strings_list[7].startswith(new_mux_prefix):
             self.mux_strings_list[7] = new_mux_string
         else:
             self.mux_strings_list.append(new_mux_string)
+
         if len(self.mux_strings_list) > 8:
             self.mux_strings_list.pop(0)
 
@@ -187,26 +191,23 @@ class mux_worker(mp.Process):
 
         #we ssh into ourselves here to get unbuffered stdout from ffmpeg...
         #I can't figure out how to get it without ssh!?
+        #same BS running it twice to get stderr for ffmpeg
         ffmpeg_concat_string = (
-            f'ssh {os.getlogin()}@localhost "ffmpeg -f concat -safe -0 -i '
-            f'\\"{self.out_path}/{self.preset['name']}/temp/{self.filename}/mux.txt\\" -c copy '
-            f'\\"{self.out_path}/{self.preset['name']}/temp/{self.filename}/{self.filename}\\" -y'
-            f'"'
+            f'ffmpeg -f concat -safe -0 -i '
+            f'\"{self.out_path}/{self.preset['name']}/temp/{self.filename}/mux.txt\" -c copy '
+            f'\"{self.out_path}/{self.preset['name']}/temp/{self.filename}/{self.filename}\" -y'
         )
 
-        stderr = ""
-        with subprocess.Popen(ffmpeg_concat_string, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=True) as process:
-            while process.poll() is None:
-                stdout = process.stdout.readline()
-                self.mux_info_queue.put(f"Muxing segments: {stdout.strip()}")
-                err = select.select([process.stderr], [], [], 0.01)[0]
-                if err:
-                    stderr = process.stderr.read()
-                time.sleep(0.01)
+        return_code, stderr = execute_cmd_ssh(ffmpeg_concat_string, "localhost", os.getlogin(), self.mux_info_queue, get_pty=True, prefix="Muxing segments: ")
 
-        if not process.returncode == 0:
-            self.mux_info_queue.put(f"Bad mux! {stderr}")
+        # paramiko can only get ffmpeg stdout with get_pty=True... But it can only get stderr with get_pty=False...
+
+        if not return_code == 0:
+            return_code, stderr = execute_cmd_ssh(ffmpeg_concat_string, "localhost", os.getlogin(), self.mux_info_queue, get_pty=False)
+            self.mux_info_queue.put(stderr.read().decode('utf-8'))
             self.close()
+
+        self.mux_info_queue.put("Muxing segments: Done! Audio transcode soon...")
 
         mux_video_only = "-A -S -B -T --no-chapters --no-attachments --no-global-tags"
         mux_audio_only = "-D -S -B -T --no-chapters --no-attachments --no-global-tags"
@@ -228,27 +229,38 @@ class mux_worker(mp.Process):
                 if 'audio' in self.additional_content[path][content_type]:
                     for track_id in self.additional_content[path][content_type]['audio']:
                         if self.preset['name'] in self.additional_content[path][content_type]['audio'][track_id]['presets']:
-                            ffmpeg_cmd = (f'ssh {os.getlogin()}@localhost "ffmpeg -i \\"{path}{self.additional_content[path]['file_list'][self.file_index]}\\" '
+                            ffmpeg_cmd = (f'ffmpeg -i \"{path}{self.additional_content[path]['file_list'][self.file_index]}\" '
                                 f'-map 0:{track_id} -map_metadata -{track_id} -map_chapters -{track_id} {self.preset['ffmpeg_audio_string']} '
-                                f'\\"{self.out_path}/{self.preset['name']}/temp/{self.filename}/audio_{track_id}_'
+                                f'\"{self.out_path}/{self.preset['name']}/temp/{self.filename}/audio_{track_id}_'
                                 f'{self.additional_content[path][content_type]['audio'][track_id]['lang']}_'
-                                f'{self.additional_content[path][content_type]['audio'][track_id]['track_name']}_{self.filename}\\" -y'
-                                f'"'
+                                f'{self.additional_content[path][content_type]['audio'][track_id]['track_name']}_{self.filename}\" -y'
                             )
 
-                            with subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                                  text=True, shell=True) as process:
-                                while process.poll() is None:
-                                    stdout = process.stdout.readline()
-                                    self.mux_info_queue.put(f"Re-encoding/copying audio: {stdout.strip()}")
-                                    err = select.select([process.stderr], [], [], 0.01)[0]
-                                    if err:
-                                        stderr = process.stderr.read()
-                                    time.sleep(0.01)
+                            #with subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            #                      text=True, shell=True) as process:
+                            #    while process.poll() is None:
+                            #        stdout = process.stdout.readline()
+                            #        self.mux_info_queue.put(f"Re-encoding/copying audio: {stdout.strip()}")
+                            #        err = select.select([process.stderr], [], [], 0.01)[0]
+                            #        if err:
+                            #            stderr = process.stderr.read()
+                            #        time.sleep(0.01)
+#
+                            #if not process.returncode == 0:
+                            #    self.mux_info_queue.put(f"Bad mux! {stderr}")
+                            #    self.close()
 
-                            if not process.returncode == 0:
-                                self.mux_info_queue.put(f"Bad mux! {stderr}")
+                            return_code, stderr = execute_cmd_ssh(ffmpeg_cmd, "localhost", os.getlogin(),
+                                                                  self.mux_info_queue, get_pty=True,
+                                                                  prefix="Transcode/copy audio: ")
+
+                            if not return_code == 0:
+                                return_code, stderr = execute_cmd_ssh(ffmpeg_cmd, "localhost", os.getlogin(),
+                                                                      self.mux_info_queue, get_pty=False)
+                                self.mux_info_queue.put(stderr.read().decode('utf-8'))
                                 self.close()
+
+                            self.mux_info_queue.put("Transcode/copy audio: Done!")
 
                             if self.additional_content[path][content_type]['audio'][track_id].get('default_flag', False):
                                 mkvmerge_mux_string += f'--default-track-flag 0 '
@@ -352,7 +364,7 @@ class encode_segment:
 
         return return_code, stderr
 
-def execute_cmd_ssh(cmd, hostname, username, stdout_queue, get_pty):
+def execute_cmd_ssh(cmd, hostname, username, stdout_queue, get_pty, prefix=""):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
@@ -371,7 +383,7 @@ def execute_cmd_ssh(cmd, hostname, username, stdout_queue, get_pty):
             for byte in iter(lambda: stdout.read(1), b""):
                 line += byte
                 if byte == b'\n' or byte == b'\r':
-                    stdout_queue.put(line.decode('utf-8', errors='replace').rstrip())
+                    stdout_queue.put(f"{prefix}{line.decode('utf-8', errors='replace').rstrip()}")
                     line = b''
     except KeyboardInterrupt:
         kill_cmd = (
