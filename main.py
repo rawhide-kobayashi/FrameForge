@@ -506,11 +506,11 @@ def job_handler(segment_list, worker_list):
     tui = rich_helper(worker_list, segment_list, mux_info_queue)
     layout = Layout()
     #layout.split_column(Layout(name="header", size=4), Layout(name="table"), Layout(name="footer", size=8))
-    layout.split_column(Layout(name="table"), Layout(name="footer", size=10))
-    layout['footer'].split_row(Layout(name="stderr"), Layout(name="Mux Info"))
+    layout.split_column(Layout(name="table"), Layout(name="stderr", size=10), Layout(name="Mux Info", size=10))
     layout['table'].update(tui.create_node_table())
 
-    layout['footer']['Mux Info'].update(Panel("Nothing here yet.", title="Mux Info"))
+    layout['stderr'].update(Panel("Nothing here yet!", title="Errors"))
+    layout['Mux Info'].update(Panel("Nothing here yet...", title="Mux Info"))
 
     segment_index = 0
     mux_string_arr = []
@@ -534,7 +534,7 @@ def job_handler(segment_list, worker_list):
                                 if segment.uuid == results[0].uuid:
                                     segment.assigned = False
                                     worker.err_cooldown.value = True
-                            layout['footer']['stderr'].update(Panel(tui.update_stderr(worker.hostname, results), title="stderr"))
+                            layout['stderr'].update(Panel(tui.update_stderr(worker.hostname, results), title="stderr"))
                             tui.worker_cur_values[worker]['Status'] = "Error"
                         worker.current_segment.value = None
                     else:
@@ -551,7 +551,7 @@ def job_handler(segment_list, worker_list):
             segment_index = 0
             layout['table'].update(tui.create_node_table())
             if not mux_info_queue.empty():
-                layout['footer']['Mux Info'].update(Panel(tui.update_mux_info(mux_info_queue), title="Mux Info"))
+                layout['Mux Info'].update(Panel(tui.update_mux_info(mux_info_queue), title="Mux Info"))
             time.sleep(0.01)
 
     for worker in worker_list:
