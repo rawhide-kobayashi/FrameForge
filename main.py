@@ -236,20 +236,6 @@ class mux_worker(mp.Process):
                                 f'{self.additional_content[path][content_type]['audio'][track_id]['track_name']}_{self.filename}\" -y'
                             )
 
-                            #with subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            #                      text=True, shell=True) as process:
-                            #    while process.poll() is None:
-                            #        stdout = process.stdout.readline()
-                            #        self.mux_info_queue.put(f"Re-encoding/copying audio: {stdout.strip()}")
-                            #        err = select.select([process.stderr], [], [], 0.01)[0]
-                            #        if err:
-                            #            stderr = process.stderr.read()
-                            #        time.sleep(0.01)
-#
-                            #if not process.returncode == 0:
-                            #    self.mux_info_queue.put(f"Bad mux! {stderr}")
-                            #    self.close()
-
                             return_code, stderr = execute_cmd_ssh(ffmpeg_cmd, "localhost", os.getlogin(),
                                                                   self.mux_info_queue, get_pty=True,
                                                                   prefix="Transcode/copy audio: ")
