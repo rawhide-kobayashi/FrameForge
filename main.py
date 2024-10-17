@@ -9,19 +9,22 @@ import re
 import math
 import tqdm
 import select
-from rich.live import Live
-from rich.table import Table
-from rich.layout import Layout
-from rich.panel import Panel
-from rich import print
+from rich.live import Live  # type: ignore
+from rich.table import Table  # type: ignore
+from rich.layout import Layout  # type: ignore
+from rich.panel import Panel  # type: ignore
+from rich import print  # type: ignore
 import paramiko
 from datetime import datetime
+from typing import Any, cast
 
-def load_config(file_path):
+
+def load_config(file_path: str) -> dict[str, Any] | list[Any] | None:
     with open(file_path, 'r') as file:
-        return yaml.safe_load(file)
+        return cast(dict[str, Any] | list[Any] | None, yaml.safe_load(file))
 
-def get_segments_and_framerate(file, frames_per_segment):
+
+def get_segments_and_framerate(file: str, frames_per_segment: int) -> tuple[int, float, int]:
     framerate_command = [
         'ffprobe', '-v', 'error', '-select_streams', 'v',
         '-of', 'default=noprint_wrappers=1:nokey=1',
@@ -35,40 +38,22 @@ def get_segments_and_framerate(file, frames_per_segment):
     ]
     framerate = subprocess.run(framerate_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     framerate_num, framerate_denom = map(float, framerate.stdout.strip().split('/'))
-    duration_seconds = subprocess.run(duration_seconds_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    duration_seconds = float(duration_seconds.stdout.strip())
-    return math.ceil(int((framerate_num / framerate_denom) * duration_seconds)  / frames_per_segment), \
+    duration_seconds: float = float(subprocess.run(duration_seconds_command, stdout=subprocess.PIPE,
+                                                   stderr=subprocess.PIPE, text=True).stdout.strip())
+    return math.ceil(int((framerate_num / framerate_denom) * duration_seconds) / frames_per_segment), \
         float(framerate_num / framerate_denom), round(duration_seconds * (framerate_num / framerate_denom))
 
-def frame_to_timestamp(frame, framerate):
+
+def frame_to_timestamp(frame: int, framerate) -> float:
     return round(float(frame / framerate), 3)
 
-def seconds_to_frames(seconds, framerate):
-    return round(framerate * seconds)
 
-class marquee:
-    def __init__(self, string):
-        self.string = list(string)
-        self.marquee_scroller = []
-        self.marquee_string = ""
+def seconds_to_frames(seconds, framerate) -> int:
+    return cast(int, round(framerate * seconds))
 
-    def reinit(self, marquee_width):
-        self.marquee_scroller = [i - 1 for i in range(marquee_width)]
-    def advance(self):
-        for x in range(len(self.marquee_scroller)):
-            if self.marquee_scroller[x] + 1 < len(self.string):
-                self.marquee_scroller[x] += 1
-            else:
-                self.marquee_scroller[x] = 0
 
-        marquee_string = ""
-        for x in range(len(self.marquee_scroller)):
-            marquee_string += self.string[self.marquee_scroller[x]]
-
-        return marquee_string
-
-class rich_helper():
-    def __init__(self, worker_list, segment_list, mux_info_queue):
+class rich_helper:
+    def __init__(self, worker_list, segment_list, mux_info_queue) -> None:
         self.worker_list = worker_list
         self.segment_list = segment_list
         self.total_frames = 0
@@ -108,7 +93,7 @@ class rich_helper():
 
         return stderr_text
 
-    def update_mux_info(self, mux_info_queue):
+    def update_mux_info(self, mux_info_queue) -> str:
         mux_text = ""
         new_mux_string = mux_info_queue.get()
         new_mux_prefix = new_mux_string.split(':')[0]
@@ -144,7 +129,7 @@ class rich_helper():
 
         return table
 
-    def update_worker_status(self, worker, status):
+    def update_worker_status(self, worker, status) -> None:
         match = re.search(pattern=r'frame=\s*(\d+)\s*fps=\s*([\d\.]+)\s*q=.*?size=\s*([\d\.]+\s*[KMG]i?B)\s*time=.*?bitrate=\s*([\d\.]+kbits/s)\s*speed=\s*([\d\.x]+)', string=status)
         if match:
             self.worker_cur_values[worker]['Status'] = "OK"
@@ -189,9 +174,9 @@ class mux_worker(mp.Process):
             for x in self.completed_segment_filename_list:
                 mux.write(f"file '{x.replace("'", "'\\''")}'\n")
 
-        #we ssh into ourselves here to get unbuffered stdout from ffmpeg...
-        #I can't figure out how to get it without ssh!?
-        #same BS running it twice to get stderr for ffmpeg
+        # we ssh into ourselves here to get unbuffered stdout from ffmpeg...
+        # I can't figure out how to get it without ssh!?
+        # same BS running it twice to get stderr for ffmpeg
         ffmpeg_concat_string = (
             f'ffmpeg -f concat -safe -0 -i '
             f'\"{self.out_path}/{self.preset['name']}/temp/{self.filename}/mux.txt\" -c copy '
@@ -201,7 +186,6 @@ class mux_worker(mp.Process):
         return_code, stderr = execute_cmd_ssh(ffmpeg_concat_string, "localhost", os.getlogin(), self.mux_info_queue, get_pty=True, prefix="Muxing segments: ")
 
         # paramiko can only get ffmpeg stdout with get_pty=True... But it can only get stderr with get_pty=False...
-
         if not return_code == 0:
             return_code, stderr = execute_cmd_ssh(ffmpeg_concat_string, "localhost", os.getlogin(), self.mux_info_queue, get_pty=False)
             self.mux_info_queue.put(stderr.read().decode('utf-8'))
@@ -230,10 +214,11 @@ class mux_worker(mp.Process):
                     for track_id in self.additional_content[path][content_type]['audio']:
                         if self.preset['name'] in self.additional_content[path][content_type]['audio'][track_id]['presets']:
                             ffmpeg_cmd = (f'ffmpeg -i \"{path}{self.additional_content[path]['file_list'][self.file_index]}\" '
-                                f'-map 0:{track_id} -map_metadata -{track_id} -map_chapters -{track_id} {self.preset['ffmpeg_audio_string']} '
-                                f'\"{self.out_path}/{self.preset['name']}/temp/{self.filename}/audio_{track_id}_'
-                                f'{self.additional_content[path][content_type]['audio'][track_id]['lang']}_'
-                                f'{self.additional_content[path][content_type]['audio'][track_id]['track_name']}_{self.filename}\" -y'
+                                          f'-map 0:{track_id} -map_metadata -{track_id} -map_chapters -{track_id} '
+                                          f'{self.preset['ffmpeg_audio_string']} \"{self.out_path}/'
+                                          f'{self.preset['name']}/temp/{self.filename}/audio_{track_id}_'
+                                          f'{self.additional_content[path][content_type]['audio'][track_id]['lang']}_'
+                                          f'{self.additional_content[path][content_type]['audio'][track_id]['track_name']}_{self.filename}\" -y'
                             )
 
                             return_code, stderr = execute_cmd_ssh(ffmpeg_cmd, "localhost", os.getlogin(),
@@ -343,8 +328,7 @@ class encode_segment:
 
         return_code, stderr = execute_cmd_ssh(cmd, hostname, current_user, stdout_queue, get_pty=True)
 
-        #paramiko can only get ffmpeg stdout with get_pty=True... But it can only get stderr with get_pty=False...
-
+        # paramiko can only get ffmpeg stdout with get_pty=True... But it can only get stderr with get_pty=False...
         if not return_code == 0:
             return_code, stderr = execute_cmd_ssh(cmd, hostname, current_user, stdout_queue, get_pty=False)
 
@@ -478,10 +462,11 @@ class encode_worker(mp.Process):
         self.close()
 
     def execute_encode(self, segment_to_encode):
-        returncode, stderr = segment_to_encode.encode(self.hostname, self.current_user, stdout_queue = self.stdout_queue)
+        returncode, stderr = segment_to_encode.encode(self.hostname, self.current_user, stdout_queue=self.stdout_queue)
         if not returncode == 0:
             self.err_timestamp = time.time()
         return returncode, stderr
+
 
 def job_handler(segment_list, worker_list):
 
@@ -491,7 +476,7 @@ def job_handler(segment_list, worker_list):
 
     tui = rich_helper(worker_list, segment_list, mux_info_queue)
     layout = Layout()
-    #layout.split_column(Layout(name="header", size=4), Layout(name="table"), Layout(name="footer", size=8))
+    # layout.split_column(Layout(name="header", size=4), Layout(name="table"), Layout(name="footer", size=8))
     layout.split_column(Layout(name="table"), Layout(name="stderr", size=10), Layout(name="Mux Info", size=10))
     layout['table'].update(tui.create_node_table())
 
@@ -505,7 +490,7 @@ def job_handler(segment_list, worker_list):
             while segment_list[segment_index].assigned and segment_index + 1 < len(segment_list):
                 segment_index += 1
             for worker in worker_list:
-                if (worker.current_segment.value is None or worker.is_running.value == False) and not worker.err_cooldown.value:
+                if (worker.current_segment.value is None or not worker.is_running.value) and not worker.err_cooldown.value:
                     if not worker.stderr_queue.empty():
                         results = worker.stderr_queue.get()
                         if results[1] == 0:
@@ -552,7 +537,8 @@ def job_handler(segment_list, worker_list):
                 print(mux_info_queue.get())
             time.sleep(0.01)
 
-def main():
+
+def main() -> None:
     current_user = os.getlogin()
 
     parser = argparse.ArgumentParser(description="Load a YAML configuration file.")
@@ -578,8 +564,8 @@ def main():
         file_fullpath = os.path.join(args.in_path, file)
         for preset in config['presets']:
             job_list += [encode_job(proper_name=f"{preset['name']}_{file}", input_file=file_fullpath, preset=preset,
-                out_path=args.out_path, filename=file, additional_content=config['additional_content'],
-                file_index=x)]
+                                    out_path=args.out_path, filename=file,
+                                    additional_content=config['additional_content'], file_index=x)]
 
     job_list = sorted(job_list, key=lambda x: x.proper_name)
     job_list[:] = [job for job in job_list if not job.check_if_exists()]
@@ -592,6 +578,7 @@ def main():
         worker_list[len(worker_list)-1].start()
 
     job_handler(job_segment_list, worker_list)
+
 
 if __name__ == "__main__":
     main()
