@@ -108,18 +108,18 @@ class MuxWorker(mp.Process):
                                             f'{path}{self.additional_content[path]['file_list'][self.file_index]}" ')
 
                 if 'attachments' in self.additional_content[path][content_type]:
-                    mkvmerge_mux_string += f'{mux_attachments_only} --attachments -1:all "{path}{self.additional_content[path]['file_list'][self.file_index]}" '
+                    mkvmerge_mux_string += (f'{mux_attachments_only} --attachments -1:all "'
+                                            f'{path}{self.additional_content[path]['file_list'][self.file_index]}" ')
 
                 if 'audio' in self.additional_content[path][content_type]:
                     for track_id in self.additional_content[path][content_type]['audio']:
-                        if self.preset['name'] in self.additional_content[path][content_type]['audio'][track_id]['presets']:
-                            ffmpeg_cmd = (f'ffmpeg -i \"{path}{self.additional_content[path]['file_list'][self.file_index]}\" '
-                                          f'-map 0:{track_id} -map_metadata -{track_id} -map_chapters -{track_id} '
-                                          f'{self.preset['ffmpeg_audio_string']} \"{self.out_path}/'
-                                          f'{self.preset['name']}/temp/{self.filename}/audio_{track_id}_'
-                                          f'{self.additional_content[path][content_type]['audio'][track_id]['lang']}_'
-                                          f'{self.additional_content[path][content_type]['audio'][track_id]['track_name']}_{self.filename}\" -y'
-                            )
+                        if self.preset['name'] in (self.additional_content[path][content_type]['audio'][track_id]
+                                                   ['presets']):
+                            ffmpeg_cmd = (f"""ffmpeg -i \"{path}{self.additional_content[path]['file_list']
+                            [self.file_index]}\" -map 0:{track_id} -map_metadata -{track_id} -map_chapters -{track_id} 
+                            {self.preset['name']}/temp/{self.filename}/audio_{track_id}_{self.additional_content[path]
+                            [content_type]['audio'][track_id]['lang']}_{self.additional_content[path][content_type]
+                            ['audio'][track_id]['track_name']}_{self.filename}\" -y""")
 
                             return_code, stderr = execute_cmd_ssh(ffmpeg_cmd, "localhost", os.getlogin(),
                                                                   self.mux_info_queue, get_pty=True,
@@ -133,33 +133,37 @@ class MuxWorker(mp.Process):
 
                             self.mux_info_queue.put("Transcode/copy audio: Done!")
 
-                            if self.additional_content[path][content_type]['audio'][track_id].get('default_flag', False):
+                            if self.additional_content[path][content_type]['audio'][track_id].get('default_flag',
+                                                                                                  False):
                                 mkvmerge_mux_string += f'--default-track-flag 0 '
-                            if self.additional_content[path][content_type]['audio'][track_id].get('original_language', False):
+                            if self.additional_content[path][content_type]['audio'][track_id].get('original_language',
+                                                                                                  False):
                                 mkvmerge_mux_string += f'--original-flag 0 '
 
-                            mkvmerge_mux_string += (f'--audio-tracks '
-                                f'0 '
-                                f'--language 0:{self.additional_content[path][content_type]['audio'][track_id]['lang']} '
-                                f'--track-name 0:"{self.additional_content[path][content_type]['audio'][track_id]['track_name']}" '
-                                f'{mux_audio_only} "{self.out_path}/{self.preset['name']}/temp/{self.filename}/audio_{track_id}_'
-                                f'{self.additional_content[path][content_type]['audio'][track_id]['lang']}_'
-                                f'{self.additional_content[path][content_type]['audio'][track_id]['track_name']}_{self.filename}" ')
+                            mkvmerge_mux_string += (f"""--audio-tracks 0 --language 0:{self.additional_content[path]
+                            [content_type]['audio'][track_id]['lang']} --track-name 0:"{self.additional_content[path]
+                            [content_type]['audio'][track_id]['track_name']}" {mux_audio_only} "{self.out_path}/
+                            {self.preset['name']}/temp/{self.filename}/audio_{track_id}_{self.additional_content[path]
+                            [content_type]['audio'][track_id]['lang']}_{self.additional_content[path][content_type]
+                            ['audio'][track_id]['track_name']}_{self.filename}" """)
 
                 if 'subtitles' in self.additional_content[path][content_type]:
                     for track_id in self.additional_content[path][content_type]['subtitles']:
-                        if self.preset['name'] in self.additional_content[path][content_type]['subtitles'][track_id]['presets']:
-                            if self.additional_content[path][content_type]['subtitles'][track_id].get('default_flag', False):
+                        if self.preset['name'] in (self.additional_content[path][content_type]['subtitles'][track_id]
+                                                   ['presets']):
+                            if self.additional_content[path][content_type]['subtitles'][track_id].get('default_flag',
+                                                                                                      False):
                                 mkvmerge_mux_string += f'--default-track-flag {track_id} '
                             if self.additional_content[path][content_type]['subtitles'][track_id].get('forced', False):
                                 mkvmerge_mux_string += f'--forced-display-flag {track_id} '
-                            if self.additional_content[path][content_type]['subtitles'][track_id].get('original_language', False):
+                            if self.additional_content[path][content_type]['subtitles'][track_id].get(
+                                    'original_language', False):
                                 mkvmerge_mux_string += f'--original-flag {track_id} '
-                            mkvmerge_mux_string += (f'--subtitle-tracks '
-                                f'{track_id} '
-                                f'--language {track_id}:{self.additional_content[path][content_type]['subtitles'][track_id]['lang']} '
-                                f'--track-name {track_id}:"{self.additional_content[path][content_type]['subtitles'][track_id]['track_name']}" '
-                                f'{mux_subtitles_only} "{path}{self.additional_content[path]['file_list'][self.file_index]}" ')
+                            mkvmerge_mux_string += (f"""--subtitle-tracks {track_id} --language {track_id}:
+                            {self.additional_content[path][content_type]['subtitles'][track_id]['lang']} --track-name 
+                            {track_id}:"{self.additional_content[path][content_type]['subtitles'][track_id]
+                            ['track_name']}" {mux_subtitles_only} "{path}{self.additional_content[path]['file_list']
+                            [self.file_index]}" """)
 
         with subprocess.Popen(mkvmerge_mux_string, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                               shell=True) as process:
@@ -207,7 +211,7 @@ class EncodeWorker(mp.Process):
             if time.time() - self.err_timestamp > 30:
                 self.err_cooldown.value = False
 
-            if not self.current_segment.value is None and self.is_running.value == True:
+            if self.current_segment.value is not None and self.is_running.value:
                 returncode, stderr = self.execute_encode(segment_to_encode=self.current_segment.value)
                 self.stderr_queue.put((self.current_segment.value, returncode, stderr))
                 self.is_running.value = False
@@ -255,7 +259,8 @@ class RichHelper:
 
     def update_stderr(self, hostname: str, stderr: tuple[Any, int, str | Exception]) -> str:
         stderr_text = ""
-        self.stderr_strings_list.append(f"{datetime.now().strftime('%H:%M:%S')} {hostname}: {str(stderr[2]).splitlines()[-1]}")
+        self.stderr_strings_list.append(f"{datetime.now().strftime('%H:%M:%S')} {hostname}: "
+                                        f"{str(stderr[2]).splitlines()[-1]}")
 
         if len(self.stderr_strings_list) > 8:
             self.stderr_strings_list.pop(0)
@@ -286,10 +291,9 @@ class RichHelper:
 
         return mux_text
 
-
     def create_node_table(self) -> Table:
-        table = Table(title=tqdm.tqdm.format_meter(n=self.cumulative_frames, total=self.total_frames, elapsed=time.time() - self.init_time,
-                                                   unit='frames'))
+        table = Table(title=tqdm.tqdm.format_meter(n=self.cumulative_frames, total=self.total_frames,
+                                                   elapsed=time.time() - self.init_time, unit='frames'))
         table.add_column(header="Hostname", min_width=16)
         table.add_column(header="Status", min_width=5)
         table.add_column(header="# Frames", min_width=8)
@@ -297,13 +301,15 @@ class RichHelper:
         table.add_column(header="Avg %RT", min_width=7)
 
         for worker in self.worker_list:
-            table.add_row(worker.hostname, self.worker_cur_values[worker]['Status'], str(self.worker_cum_values[worker]['Frame']),
-                          str(self.worker_avg_values[worker]['FPS']), f"{self.worker_avg_values[worker]['%RT']}x")
+            table.add_row(worker.hostname, self.worker_cur_values[worker]['Status'],
+                          str(self.worker_cum_values[worker]['Frame']), str(self.worker_avg_values[worker]['FPS']),
+                          f"{self.worker_avg_values[worker]['%RT']}x")
 
         return table
 
     def update_worker_status(self, worker: EncodeWorker, status: str) -> None:
-        match = re.search(pattern=r'frame=\s*(\d+)\s*fps=\s*([\d\.]+)\s*q=.*?size=\s*([\d\.]+\s*[KMG]i?B)\s*time=.*?bitrate=\s*([\d\.]+kbits/s)\s*speed=\s*([\d\.x]+)', string=status)
+        match = re.search(pattern=r'frame=\s*(\d+)\s*fps=\s*([\d\.]+)\s*q=.*?size=\s*([\d\.]+\s*[KMG]i?B)\s*time=.*?bit'
+                                  r'rate=\s*([\d\.]+kbits/s)\s*speed=\s*([\d\.x]+)', string=status)
         if match:
             self.worker_cur_values[worker]['Status'] = "OK"
             self.worker_cur_values[worker]['Frame'] = int(match.group(1))
@@ -312,12 +318,18 @@ class RichHelper:
             for stat in self.worker_cur_values[worker]:
                 try:
                     if stat == 'Frame':
-                        if not cast(int, self.worker_cur_values[worker][stat]) == cast(int, self.worker_last_values[worker][stat]):
-                            if cast(int, self.worker_cur_values[worker][stat]) > cast(int, self.worker_last_values[worker][stat]):
-                                self.cumulative_frames += cast(int, self.worker_cur_values[worker][stat]) - cast(int, self.worker_last_values[worker][stat])
-                                self.worker_cum_values[worker][stat] += cast(int, self.worker_cur_values[worker][stat]) - cast(int, self.worker_last_values[worker][stat])
+                        if not (cast(int, self.worker_cur_values[worker][stat]) ==
+                                cast(int, self.worker_last_values[worker][stat])):
+                            if (cast(int, self.worker_cur_values[worker][stat]) >
+                                    cast(int, self.worker_last_values[worker][stat])):
+                                self.cumulative_frames += (cast(int, self.worker_cur_values[worker][stat]) -
+                                                           cast(int, self.worker_last_values[worker][stat]))
+                                self.worker_cum_values[worker][stat] += (
+                                        cast(int, self.worker_cur_values[worker][stat]) -
+                                        cast(int, self.worker_last_values[worker][stat]))
                     elif not stat == 'Status':
-                        self.worker_avg_values[worker][stat] = round((cast(int | float, self.worker_cur_values[worker][stat]) +
+                        self.worker_avg_values[worker][stat] = round((cast(int | float,
+                                                                           self.worker_cur_values[worker][stat]) +
                                                                       self.worker_cum_values[worker][stat]) /
                                                                      self.worker_cum_values[worker]['accumulation'], 3)
                         self.worker_cum_values[worker][stat] += cast(int | float, self.worker_cur_values[worker][stat])
@@ -335,7 +347,8 @@ class RichHelper:
 
 class EncodeSegment:
     def __init__(self, framerate: float, file_fullpath: str, out_path: str, segment_start: int, segment_end: int,
-                 ffmpeg_video_string: str, preset: dict[str, str], filename: str, encode_job: EncodeJob, num_frames: int) -> None:
+                 ffmpeg_video_string: str, preset: dict[str, str], filename: str, encode_job: EncodeJob,
+                 num_frames: int) -> None:
         self.framerate = framerate
         self.file_fullpath = file_fullpath
         self.out_path = out_path
@@ -421,7 +434,6 @@ def execute_cmd_ssh(cmd: str, hostname: str, username: str, stdout_queue: mp.Que
 
     client.close()
     return stdout.channel.recv_exit_status(), stderr.read().decode('utf-8')
-
 
 
 class EncodeJob:
@@ -603,8 +615,8 @@ def main() -> None:
     for jobs in job_list:
         job_segment_list += jobs.create_segment_encode_list()
 
-    for worker in config['nodes']:
-        worker_list += [EncodeWorker(hostname=worker['hostname'], current_user=current_user)]
+    for worker_hostname in config['nodes']:
+        worker_list += [EncodeWorker(hostname=worker_hostname, current_user=current_user)]
         worker_list[len(worker_list)-1].start()
 
     job_handler(job_segment_list, worker_list)
