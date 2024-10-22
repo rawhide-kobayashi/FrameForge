@@ -18,6 +18,7 @@ from rich import print  # type: ignore
 import paramiko
 from datetime import datetime
 from typing import Any, cast
+import json
 
 
 def load_config(file_path: str) -> dict[str, Any]:
@@ -187,7 +188,7 @@ class MuxWorker(mp.Process):
         self.close()
 
 
-class EncodeWorker(mp.Process):
+class NodeManager(mp.Process):
     def __init__(self, hostname: str, current_user: str) -> None:
         super().__init__()
         self.hostname = hostname
@@ -195,13 +196,16 @@ class EncodeWorker(mp.Process):
         self.manager = mp.Manager()
         self.current_segment = self.manager.Namespace()
         self.current_segment.value = None
-        self.is_running = mp.Value('b', False)
+        self.is_running = self.manager.Namespace()
+        self.is_running.value = False
         # by "any" of course, I mean, mp.Manager.Value, but I couldn't figure out how to make mypy happy
         self.stdout_queue: mp.Queue[str] = mp.Queue()
         self.stderr_queue: mp.Queue[tuple[Any, int, str | Exception]] = mp.Queue()
         self.shutdown = mp.Value('b', False)
         self.err_cooldown = mp.Value('b', False)
         self.err_timestamp = 0.0
+
+        get_cpu_info(self.hostname, self.current_user, self.stdout_queue)
 
     def return_hostname(self) -> str:
         return self.hostname
@@ -219,7 +223,7 @@ class EncodeWorker(mp.Process):
             time.sleep(1)
         self.close()
 
-    def execute_encode(self, segment_to_encode: EncodeSegment) -> tuple[int, str | Exception]:
+    def execute_encode(self, segment_to_encode: VideoSegment) -> tuple[int, str | Exception]:
         returncode, stderr = segment_to_encode.encode(self.hostname, self.current_user, stdout_queue=self.stdout_queue)
         if not returncode == 0:
             self.err_timestamp = time.time()
@@ -227,7 +231,7 @@ class EncodeWorker(mp.Process):
 
 
 class RichHelper:
-    def __init__(self, worker_list: list[EncodeWorker], segment_list: list[EncodeSegment],
+    def __init__(self, worker_list: list[NodeManager], segment_list: list[VideoSegment],
                  mux_info_queue: mp.Queue[str]) -> None:
         self.worker_list = worker_list
         self.segment_list = segment_list
@@ -235,10 +239,10 @@ class RichHelper:
         self.cumulative_frames = 0
         self.init_time = time.time()
         self.mux_info_queue = mux_info_queue
-        self.worker_cum_values: dict[EncodeWorker, dict[str, float | int]] = {}
-        self.worker_last_values: dict[EncodeWorker, dict[str, float | int]] = {}
-        self.worker_avg_values: dict[EncodeWorker, dict[str, float]] = {}
-        self.worker_cur_values: dict[EncodeWorker, dict[str, float | int | str]] = {}
+        self.worker_cum_values: dict[NodeManager, dict[str, float | int]] = {}
+        self.worker_last_values: dict[NodeManager, dict[str, float | int]] = {}
+        self.worker_avg_values: dict[NodeManager, dict[str, float]] = {}
+        self.worker_cur_values: dict[NodeManager, dict[str, float | int | str]] = {}
         # was I planning on using these?
         # self.worker_status_header: dict[EncodeWorker, str] = {}
         # self.worker_status_stderr: dict[EncodeWorker.stderr_queue] = {}
@@ -307,7 +311,7 @@ class RichHelper:
 
         return table
 
-    def update_worker_status(self, worker: EncodeWorker, status: str) -> None:
+    def update_worker_status(self, worker: NodeManager, status: str) -> None:
         match = re.search(pattern=r'frame=\s*(\d+)\s*fps=\s*([\d\.]+)\s*q=.*?size=\s*([\d\.]+\s*[KMG]i?B)\s*time=.*?bit'
                                   r'rate=\s*([\d\.]+kbits/s)\s*speed=\s*([\d\.x]+)', string=status)
         if match:
@@ -345,7 +349,7 @@ class RichHelper:
             self.worker_cur_values[worker]['Status'] = "Seek"
 
 
-class EncodeSegment:
+class VideoSegment:
     def __init__(self, framerate: float, file_fullpath: str, out_path: str, segment_start: int, segment_end: int,
                  ffmpeg_video_string: str, preset: dict[str, str], filename: str, encode_job: EncodeJob,
                  num_frames: int) -> None:
@@ -419,7 +423,7 @@ def execute_cmd_ssh(cmd: str, hostname: str, username: str, stdout_queue: mp.Que
     stdin, stdout, stderr = client.exec_command(cmd, get_pty=get_pty)
     try:
         line = b''
-        while not stdout.channel.exit_status_ready():
+        while not stdout.channel.exit_status_ready() or stdout.channel.recv_ready():
             for byte in iter(lambda: stdout.read(1), b""):
                 line += byte
                 if byte == b'\n' or byte == b'\r':
@@ -489,25 +493,25 @@ class EncodeJob:
                             self.additional_content, self.file_index, mux_info_queue)
             mux.start()
 
-    def create_segment_encode_list(self) -> list[EncodeSegment]:
+    def create_segment_encode_list(self) -> list[VideoSegment]:
         segment_list = []
         frames_assigned = 0
         last_segment_compensation = self.frames_per_segment
         for x in range(self.num_segments):
             if self.frames_total - frames_assigned < self.frames_per_segment:
                 last_segment_compensation = self.frames_total - frames_assigned
-            segment_list += [EncodeSegment(framerate=self.framerate, file_fullpath=self.input_file,
-                                           out_path=self.out_path,
-                                           ffmpeg_video_string=self.preset['ffmpeg_video_string'],
-                                           segment_start=x * self.frames_per_segment,
-                                           segment_end=(x + 1) * self.frames_per_segment,
-                                           preset=self.preset, filename=self.filename, encode_job=self,
-                                           num_frames=last_segment_compensation)]
+            segment_list += [VideoSegment(framerate=self.framerate, file_fullpath=self.input_file,
+                                          out_path=self.out_path,
+                                          ffmpeg_video_string=self.preset['ffmpeg_video_string'],
+                                          segment_start=x * self.frames_per_segment,
+                                          segment_end=(x + 1) * self.frames_per_segment,
+                                          preset=self.preset, filename=self.filename, encode_job=self,
+                                          num_frames=last_segment_compensation)]
             frames_assigned += self.frames_per_segment
         return segment_list
 
 
-def job_handler(segment_list: list[EncodeSegment], worker_list: list[EncodeWorker]) -> None:
+def job_handler(segment_list: list[VideoSegment], worker_list: list[NodeManager]) -> None:
 
     mux_info_queue: mp.Queue[str] = mp.Queue()
 
@@ -580,6 +584,105 @@ def job_handler(segment_list: list[EncodeSegment], worker_list: list[EncodeWorke
             time.sleep(0.01)
 
 
+def get_cpu_info(hostname: str, username: str,
+                 stdout_queue: mp.Queue[str]) -> tuple[bool | Exception, dict[Any, Any] | Exception]:
+    print(hostname)
+    avx512_dict: dict[Any, Any] = {}
+    core_info_dict: dict[Any, Any] = {}
+    mapped_threads = {
+        'numa_nodes': {
+            '0': {
+                'cores': {
+                    '0': {
+                        'threads': ['0']
+                    }
+                }
+            }
+        }
+    }
+
+    # tragic: for no apparent reason, paramiko randomly returns a very, very small fraction of the full stdout
+    # so, we simply retry until we get uncorrupted json :)
+    while len(avx512_dict) == 0:
+        try:
+            avx512_info = execute_cmd_ssh("lscpu --json", hostname, username, stdout_queue, get_pty=True)
+            avx512_stdout = ""
+            if avx512_info[0] == 0:
+                while not stdout_queue.empty():
+                    avx512_stdout += stdout_queue.get()
+
+            elif avx512_info[0] == -1:
+                print(avx512_info[1])
+                print(f"Failed to connect to {hostname}.")
+                return cast(Exception, avx512_info[1]), core_info_dict
+
+            avx512_dict = json.loads(avx512_stdout)
+
+        except json.decoder.JSONDecodeError:
+            continue
+
+    # I can't even with this data structure. This retrieves the CPU feature flag str to determine avx512 availability.
+    for child in avx512_dict['lscpu'][2]['children'][0]['children']:
+        if child['field'] == 'Flags:':
+            avx512_present = True if 'avx512' in child['data'] else False
+            print(f"AVX512 Capability Detected: {avx512_present}")
+
+    while len(core_info_dict) == 0:
+        try:
+            core_info = execute_cmd_ssh("lscpu --json --extended", hostname, username, stdout_queue, get_pty=True)
+            core_info_stdout = ""
+            if core_info[0] == 0:
+                while not stdout_queue.empty():
+                    core_info_stdout += stdout_queue.get()
+
+            elif core_info[0] == -1:
+                print(core_info[1])
+                print(f"Failed to connect to {hostname}.")
+                break
+
+            # print(json.loads(core_info_stdout))
+            core_info_dict = json.loads(core_info_stdout)
+
+        except json.decoder.JSONDecodeError:
+            continue
+
+    # Restructure the returned thread data. This is the only way to properly deal with asymmetrical CPUs that have
+    # cores with variable thread counts, and it makes NUMA easier.
+
+    for thread in core_info_dict['cpus']:
+        node = str(thread['node']) if 'node' in thread else '0'
+
+        if node not in mapped_threads['numa_nodes']:
+            mapped_threads['numa_nodes'].update({
+                str(node): {
+                    'cores': {
+                        str(thread['core']): {
+                            'threads': [
+                                str(thread['cpu'])
+                            ]
+                        }
+                    }
+                }
+            })
+
+        if str(thread['core']) not in mapped_threads['numa_nodes'][node]['cores']:
+            mapped_threads['numa_nodes'][node]['cores'].update({
+                str(thread['core']): {
+                    'threads': [
+                        str(thread['cpu'])
+                    ]
+                }
+            })
+
+        if str(thread['cpu']) not in mapped_threads['numa_nodes'][node]['cores'][str(thread['core'])]['threads']:
+            mapped_threads['numa_nodes'][node]['cores'][str(thread['core'])]['threads'].append(str(thread['cpu']))
+
+    print(mapped_threads)
+
+    # noinspection PyUnboundLocalVariable
+    return avx512_present, mapped_threads
+
+
 def main() -> None:
     current_user = os.getlogin()
 
@@ -599,6 +702,10 @@ def main() -> None:
     job_list = []
     worker_list = []
 
+    for worker_hostname in config['nodes']:
+        worker_list += [NodeManager(hostname=worker_hostname, current_user=current_user)]
+        worker_list[len(worker_list)-1].start()
+
     for path in config['additional_content']:
         config['additional_content'][path]['file_list'] = sorted(os.listdir(path))
 
@@ -615,11 +722,9 @@ def main() -> None:
     for jobs in job_list:
         job_segment_list += jobs.create_segment_encode_list()
 
-    for worker_hostname in config['nodes']:
-        worker_list += [EncodeWorker(hostname=worker_hostname, current_user=current_user)]
-        worker_list[len(worker_list)-1].start()
+    print("it's over")
 
-    job_handler(job_segment_list, worker_list)
+    # job_handler(job_segment_list, worker_list)
 
 
 if __name__ == "__main__":
