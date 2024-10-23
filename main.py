@@ -248,8 +248,14 @@ class NodeManager(mp.Process):
         while len(self.segment_list) > 0:
             self.segment_list_lock.acquire()
             # you have to use .keys for a managed list... Because... Because you just do, okay?!
-            for key in self.segment_list.keys():
-                print(self.segment_list[key])
+            for segment in self.segment_list.keys():
+                if not self.segment_list[segment]['assigned']:
+                    if segment.encode_job.preset['optimize_jobs']:
+                        for numa_node in mapped_threads['numa_nodes']:
+                            core_list =
+                            for core in mapped_threads['numa_nodes'][numa_node]['cores']
+
+
 
 
 class NodeWorker(mp.Process):
@@ -449,12 +455,16 @@ class VideoSegment:
             return False
 
     def encode(self, hostname: str, current_user: str, stdout_queue: mp.Queue[str],
-               pool_threads: int) -> tuple[int, str | Exception]:
+               pool_threads: int, avx512: bool) -> tuple[int, str | Exception]:
         cmd = (f'ffmpeg -ss {self.segment_start} -to {self.segment_end} -i \\"{self.encode_job.input_file}\\" -c:v '
                f'{self.encode_job.preset['video_encoder']} {self.encode_job.preset['ffmpeg_video_params']} ')
 
         if self.encode_job.preset['video_encoder'] == 'libx265':
             cmd += f'-x265-params "{self.encode_job.preset['encoder_params']}'
+
+            if avx512:
+                cmd += f':asm=avx512'
+
             if self.encode_job.preset['optimize_jobs']:
                 cmd += f':pmode=1:frame-threads=1:pools=\'{pool_threads}\'" \\"{self.file_output_fstring}\\"'
 
@@ -648,11 +658,13 @@ def get_cpu_info(hostname: str, username: str,
     print(hostname)
     avx512_dict: dict[Any, Any] = {}
     core_info_dict: dict[Any, Any] = {}
-    mapped_threads = {
+    # mypy giving me grief at the end of this function if I define it as dict[str, bool | set[str]] whatever
+    mapped_threads: dict[str, dict[str, dict[str, dict[str, dict[str, Any]]]]] = {
         'numa_nodes': {
             '0': {
                 'cores': {
                     '0': {
+                        'assigned': False,
                         'threads': {'0'}
                     }
                 }
@@ -717,6 +729,7 @@ def get_cpu_info(hostname: str, username: str,
                     'cores': {
                         str(thread['core']): {
                             'threads': {
+                                'assigned': False,
                                 str(thread['cpu'])
                             }
                         }
@@ -727,6 +740,7 @@ def get_cpu_info(hostname: str, username: str,
         if str(thread['core']) not in mapped_threads['numa_nodes'][node]['cores']:
             mapped_threads['numa_nodes'][node]['cores'].update({
                 str(thread['core']): {
+                    'assigned': False,
                     'threads': {
                         str(thread['cpu'])
                     }
@@ -738,6 +752,12 @@ def get_cpu_info(hostname: str, username: str,
 
     # noinspection PyUnboundLocalVariable
     return avx512, mapped_threads
+
+class CPUCore:
+    def __init__(self, core_id: str) -> None:
+        self.core_id = core_id
+        self.assigned = False
+        self.threads = set()
 
 
 def main() -> None:
@@ -780,7 +800,7 @@ def main() -> None:
     for jobs in job_list:
         segment_templist = jobs.create_segment_encode_list()
         for segment in segment_templist:
-            segment_list.update({segment: {'Assigned': False}})
+            segment_list.update({segment: {'assigned': False}})
 
     print(type(segment_list))
 
