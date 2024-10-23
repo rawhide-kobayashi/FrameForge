@@ -19,6 +19,7 @@ import paramiko
 from datetime import datetime
 from typing import Any, cast
 import json
+from multiprocessing.synchronize import Lock as TypedLock
 
 
 def load_config(file_path: str) -> dict[str, Any]:
@@ -189,10 +190,64 @@ class MuxWorker(mp.Process):
 
 
 class NodeManager(mp.Process):
-    def __init__(self, hostname: str, current_user: str) -> None:
+    def __init__(self, hostname: str, current_user: str,
+                 worker_list: mp.managers.DictProxy[NodeManager, set[NodeWorker]],
+                 job_list: mp.managers.DictProxy[VideoSegment, dict[str, bool]],
+                 job_list_lock: TypedLock, optimize_jobs: bool, video_encoder: str) -> None:
         super().__init__()
         self.hostname = hostname
         self.current_user = current_user
+        self.stdout_queue: mp.Queue[str] = mp.Queue()
+        self.optimize_jobs = optimize_jobs
+        self.video_encoder = video_encoder
+        self.worker_list = worker_list
+        self.worker_list.update({self: set()})
+
+    def run(self) -> None:
+        avx512, mapped_threads = get_cpu_info(self.hostname, self.current_user, self.stdout_queue)
+
+        if isinstance(avx512, bool) and isinstance(mapped_threads, dict):
+            # I've only figured out the optimal core count for x265, which is four, with one frame thread, for optimal
+            # speed and encoding efficiency. I have not tested optimal settings for other codecs or encoders yet.
+            if self.optimize_jobs:
+                if self.video_encoder == 'libx265' and len(mapped_threads['numa_nodes']['0']['cores']) >= 4:
+                    optimized_core_count = 4
+                # who the hell still runs machines with <4 cores though
+                elif self.video_encoder == 'libx265' and len(mapped_threads['numa_nodes']['0']['cores']) < 4:
+                    optimized_core_count = len(mapped_threads['numa_nodes']['0']['cores'])
+                # default behavior for encoders/codecs with undetermined thread optimization
+                else:
+                    worker = NodeWorker(self, taskset_threads="", optimize_jobs=False,
+                                        video_encoder=self.video_encoder)
+                    self.worker_list[self].add(worker)
+
+                for node in mapped_threads['numa_nodes']:
+                    job_core_tracker = 0
+                    taskset_threads = "taskset --cpu-list "
+                    for core in mapped_threads['numa_nodes'][node]['cores']:
+                        for thread in mapped_threads['numa_nodes'][node]['cores'][core]['threads']:
+                            taskset_threads += f"{thread},"
+
+                        job_core_tracker += 1
+                        if job_core_tracker == optimized_core_count:
+                            taskset_threads = taskset_threads[:-1]
+                            worker = NodeWorker(self, taskset_threads=taskset_threads, optimize_jobs=self.optimize_jobs,
+                                                video_encoder=self.video_encoder)
+                            self.worker_list[self].add(worker)
+                            worker.start()
+                            job_core_tracker = 0
+                            taskset_threads = "taskset --cpu-list "
+                            print(self.worker_list)
+
+            else:  # run one worker per node with whatever default settings the codec has regarding scaling
+                worker = NodeWorker(self, taskset_threads="", optimize_jobs=self.optimize_jobs,
+                                    video_encoder=self.video_encoder)
+                self.worker_list[self].add(worker)
+
+
+class NodeWorker(mp.Process):
+    def __init__(self, node_info: NodeManager, taskset_threads: str, optimize_jobs: bool, video_encoder: str) -> None:
+        super().__init__()
         self.manager = mp.Manager()
         self.current_segment = self.manager.Namespace()
         self.current_segment.value = None
@@ -205,10 +260,7 @@ class NodeManager(mp.Process):
         self.err_cooldown = mp.Value('b', False)
         self.err_timestamp = 0.0
 
-        get_cpu_info(self.hostname, self.current_user, self.stdout_queue)
-
-    def return_hostname(self) -> str:
-        return self.hostname
+        self.node_info = node_info
 
     def run(self) -> None:
         while not self.shutdown.value:
@@ -224,7 +276,8 @@ class NodeManager(mp.Process):
         self.close()
 
     def execute_encode(self, segment_to_encode: VideoSegment) -> tuple[int, str | Exception]:
-        returncode, stderr = segment_to_encode.encode(self.hostname, self.current_user, stdout_queue=self.stdout_queue)
+        returncode, stderr = segment_to_encode.encode(self.node_info.hostname, self.node_info.current_user,
+                                                      stdout_queue=self.stdout_queue)
         if not returncode == 0:
             self.err_timestamp = time.time()
         return returncode, stderr
@@ -350,23 +403,15 @@ class RichHelper:
 
 
 class VideoSegment:
-    def __init__(self, framerate: float, file_fullpath: str, out_path: str, segment_start: int, segment_end: int,
-                 ffmpeg_video_string: str, preset: dict[str, str], filename: str, encode_job: EncodeJob,
-                 num_frames: int) -> None:
-        self.framerate = framerate
-        self.file_fullpath = file_fullpath
-        self.out_path = out_path
-        self.segment_start = frame_to_timestamp(segment_start, framerate)
-        self.segment_end = frame_to_timestamp(segment_end, framerate)
-        self.ffmpeg_video_string = ffmpeg_video_string
-        self.preset = preset
-        self.filename = filename
-        self.uuid = uuid.uuid4()
+    def __init__(self, segment_start: int, segment_end: int, encode_job: EncodeJob, num_frames: int) -> None:
         self.encode_job = encode_job
+        self.segment_start = frame_to_timestamp(segment_start, self.encode_job.framerate)
+        self.segment_end = frame_to_timestamp(segment_end, self.encode_job.framerate)
         self.assigned = False
         self.num_frames = num_frames
-        self.file_output_fstring = (f"{self.out_path}/{self.preset['name']}/temp/{filename}/{self.segment_start}-"
-                                    f"{self.segment_end}_{self.filename}")
+        self.file_output_fstring = (f"{self.encode_job.out_path}/{self.encode_job.preset['name']}/temp/"
+                                    f"{self.encode_job.filename}/{self.segment_start}-{self.segment_end}_"
+                                    f"{self.encode_job.filename}")
 
     def check_if_exists(self, mux_info_queue: mp.Queue[str]) -> bool:
         cmd = [
@@ -378,7 +423,7 @@ class VideoSegment:
             duration_proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             if duration_proc.returncode == 0:
                 duration = round(float(duration_proc.stdout.strip()), 3)
-                if seconds_to_frames(duration, self.framerate) == self.num_frames:
+                if seconds_to_frames(duration, self.encode_job.framerate) == self.num_frames:
                     self.encode_job.tally_completed_segments(self.file_output_fstring, mux_info_queue)
                     return True
                 else:
@@ -393,7 +438,7 @@ class VideoSegment:
     def encode(self, hostname: str, current_user: str, stdout_queue: mp.Queue[str]) -> tuple[int, str | Exception]:
         cmd = (
             f'ffmpeg -ss {self.segment_start} -to {self.segment_end} -i '
-            f'\"{self.file_fullpath}\" '
+            f'\"{self.encode_job.input_file}\" '
             f"{self.ffmpeg_video_string} "
             f'\"{self.file_output_fstring}\"'
         )
@@ -441,11 +486,11 @@ def execute_cmd_ssh(cmd: str, hostname: str, username: str, stdout_queue: mp.Que
 
 
 class EncodeJob:
-    def __init__(self, proper_name: str, input_file: str, preset: dict[str, str], out_path: str, filename: str,
+    def __init__(self, input_file: str, preset: dict[str, str], out_path: str, filename: str,
                  additional_content: dict[str, Any], file_index: int) -> None:
         self.input_file = input_file
-        self.proper_name = proper_name
-        self.frames_per_segment = 2000
+        self.job_name = f"{preset['name']}_{filename}"
+        self.frames_per_segment = int(preset['frames_per_segment'])
         self.num_segments, self.framerate, self.frames_total = get_segments_and_framerate(self.input_file,
                                                                                           self.frames_per_segment)
         self.preset = preset
@@ -500,13 +545,9 @@ class EncodeJob:
         for x in range(self.num_segments):
             if self.frames_total - frames_assigned < self.frames_per_segment:
                 last_segment_compensation = self.frames_total - frames_assigned
-            segment_list += [VideoSegment(framerate=self.framerate, file_fullpath=self.input_file,
-                                          out_path=self.out_path,
-                                          ffmpeg_video_string=self.preset['ffmpeg_video_string'],
-                                          segment_start=x * self.frames_per_segment,
+            segment_list += [VideoSegment(segment_start=x * self.frames_per_segment,
                                           segment_end=(x + 1) * self.frames_per_segment,
-                                          preset=self.preset, filename=self.filename, encode_job=self,
-                                          num_frames=last_segment_compensation)]
+                                          encode_job=self, num_frames=last_segment_compensation)]
             frames_assigned += self.frames_per_segment
         return segment_list
 
@@ -594,7 +635,7 @@ def get_cpu_info(hostname: str, username: str,
             '0': {
                 'cores': {
                     '0': {
-                        'threads': ['0']
+                        'threads': {'0'}
                     }
                 }
             }
@@ -624,8 +665,8 @@ def get_cpu_info(hostname: str, username: str,
     # I can't even with this data structure. This retrieves the CPU feature flag str to determine avx512 availability.
     for child in avx512_dict['lscpu'][2]['children'][0]['children']:
         if child['field'] == 'Flags:':
-            avx512_present = True if 'avx512' in child['data'] else False
-            print(f"AVX512 Capability Detected: {avx512_present}")
+            avx512 = True if 'avx512' in child['data'] else False
+            print(f"AVX512 Capability Detected: {avx512}")
 
     while len(core_info_dict) == 0:
         try:
@@ -657,9 +698,9 @@ def get_cpu_info(hostname: str, username: str,
                 str(node): {
                     'cores': {
                         str(thread['core']): {
-                            'threads': [
+                            'threads': {
                                 str(thread['cpu'])
-                            ]
+                            }
                         }
                     }
                 }
@@ -668,19 +709,19 @@ def get_cpu_info(hostname: str, username: str,
         if str(thread['core']) not in mapped_threads['numa_nodes'][node]['cores']:
             mapped_threads['numa_nodes'][node]['cores'].update({
                 str(thread['core']): {
-                    'threads': [
+                    'threads': {
                         str(thread['cpu'])
-                    ]
+                    }
                 }
             })
 
         if str(thread['cpu']) not in mapped_threads['numa_nodes'][node]['cores'][str(thread['core'])]['threads']:
-            mapped_threads['numa_nodes'][node]['cores'][str(thread['core'])]['threads'].append(str(thread['cpu']))
+            mapped_threads['numa_nodes'][node]['cores'][str(thread['core'])]['threads'].add(str(thread['cpu']))
 
     print(mapped_threads)
 
     # noinspection PyUnboundLocalVariable
-    return avx512_present, mapped_threads
+    return avx512, mapped_threads
 
 
 def main() -> None:
@@ -699,12 +740,17 @@ def main() -> None:
     print(args.in_path)
     print(args.out_path)
 
-    job_list = []
-    worker_list = []
+    manager = mp.Manager()
+    worker_list = manager.dict()
 
-    for worker_hostname in config['nodes']:
-        worker_list += [NodeManager(hostname=worker_hostname, current_user=current_user)]
-        worker_list[len(worker_list)-1].start()
+    job_list = manager.list()
+
+    segment_list = manager.dict()
+    segment_list_lock = mp.Lock()
+
+    # for worker_hostname in config['nodes']:
+    #     worker_list.update({NodeManager(hostname=worker_hostname, current_user=current_user, worker_list=worker_list,
+    #                                     job_list=job_list, job_list_lock=job_list_lock): set()}, optimize_jobs=config['optimize_jobs'], video_)
 
     for path in config['additional_content']:
         config['additional_content'][path]['file_list'] = sorted(os.listdir(path))
@@ -712,11 +758,12 @@ def main() -> None:
     for x, file in enumerate(sorted(os.listdir(args.in_path)), start=0):
         file_fullpath = os.path.join(args.in_path, file)
         for preset in config['presets']:
-            job_list += [EncodeJob(proper_name=f"{preset['name']}_{file}", input_file=file_fullpath, preset=preset,
-                                   out_path=args.out_path, filename=file,
+            job_list += [EncodeJob(input_file=file_fullpath, preset=preset, out_path=args.out_path, filename=file,
                                    additional_content=config['additional_content'], file_index=x)]
 
-    job_list = sorted(job_list, key=lambda job: job.proper_name)
+
+
+    job_list = sorted(job_list, key=lambda job: job.job_name)
     job_list[:] = [job for job in job_list if not job.check_if_exists()]
     job_segment_list = []
     for jobs in job_list:
