@@ -3,7 +3,6 @@ import yaml
 import argparse
 import os
 import subprocess
-import uuid
 import multiprocessing as mp
 import time
 import re
@@ -191,58 +190,66 @@ class MuxWorker(mp.Process):
 
 class NodeManager(mp.Process):
     def __init__(self, hostname: str, current_user: str,
-                 worker_list: mp.managers.DictProxy[NodeManager, set[NodeWorker]],
-                 job_list: mp.managers.DictProxy[VideoSegment, dict[str, bool]],
-                 job_list_lock: TypedLock, optimize_jobs: bool, video_encoder: str) -> None:
+                 job_list: mp.managers.ListProxy[EncodeJob], job_list_lock: TypedLock,
+                 segment_list: mp.managers.DictProxy[VideoSegment, dict[str, bool]],
+                 segment_list_lock: TypedLock) -> None:
         super().__init__()
         self.hostname = hostname
         self.current_user = current_user
-        self.stdout_queue: mp.Queue[str] = mp.Queue()
-        self.optimize_jobs = optimize_jobs
-        self.video_encoder = video_encoder
-        self.worker_list = worker_list
-        self.worker_list.update({self: set()})
+        self.stdout_queue: mp.Manager().Queue[str] = mp.Manager().Queue()
+        self.job_list = job_list
+        self.job_list_lock = job_list_lock
+        self.segment_list = segment_list
+        self.segment_list_lock = segment_list_lock
 
     def run(self) -> None:
-        avx512, mapped_threads = get_cpu_info(self.hostname, self.current_user, self.stdout_queue)
 
-        if isinstance(avx512, bool) and isinstance(mapped_threads, dict):
-            # I've only figured out the optimal core count for x265, which is four, with one frame thread, for optimal
-            # speed and encoding efficiency. I have not tested optimal settings for other codecs or encoders yet.
-            if self.optimize_jobs:
-                if self.video_encoder == 'libx265' and len(mapped_threads['numa_nodes']['0']['cores']) >= 4:
-                    optimized_core_count = 4
-                # who the hell still runs machines with <4 cores though
-                elif self.video_encoder == 'libx265' and len(mapped_threads['numa_nodes']['0']['cores']) < 4:
-                    optimized_core_count = len(mapped_threads['numa_nodes']['0']['cores'])
-                # default behavior for encoders/codecs with undetermined thread optimization
-                else:
-                    worker = NodeWorker(self, taskset_threads="", optimize_jobs=False,
-                                        video_encoder=self.video_encoder)
-                    self.worker_list[self].add(worker)
+        avx512 = None
+        mapped_threads = None
 
-                for node in mapped_threads['numa_nodes']:
-                    job_core_tracker = 0
-                    taskset_threads = "taskset --cpu-list "
-                    for core in mapped_threads['numa_nodes'][node]['cores']:
-                        for thread in mapped_threads['numa_nodes'][node]['cores'][core]['threads']:
-                            taskset_threads += f"{thread},"
+        while not isinstance(avx512, bool) and not isinstance(mapped_threads, dict):
+            avx512, mapped_threads = get_cpu_info(self.hostname, self.current_user, self.stdout_queue)
+            print(avx512, mapped_threads)
 
-                        job_core_tracker += 1
-                        if job_core_tracker == optimized_core_count:
-                            taskset_threads = taskset_threads[:-1]
-                            worker = NodeWorker(self, taskset_threads=taskset_threads, optimize_jobs=self.optimize_jobs,
-                                                video_encoder=self.video_encoder)
-                            self.worker_list[self].add(worker)
-                            worker.start()
-                            job_core_tracker = 0
-                            taskset_threads = "taskset --cpu-list "
-                            print(self.worker_list)
+        # I've only figured out the optimal core count for x265, which is four, with one frame thread, for optimal
+        # speed and encoding efficiency. I have not tested optimal settings for other codecs or encoders yet.
+        # if self.optimize_jobs:
+        #     if self.video_encoder == 'libx265' and len(mapped_threads['numa_nodes']['0']['cores']) >= 4:
+        #         optimized_core_count = 4
+        #     # who the hell still runs machines with <4 cores though
+        #     elif self.video_encoder == 'libx265' and len(mapped_threads['numa_nodes']['0']['cores']) < 4:
+        #         optimized_core_count = len(mapped_threads['numa_nodes']['0']['cores'])
+        #     # default behavior for encoders/codecs with undetermined thread optimization
+        #     else:
+        #         worker = NodeWorker(self, taskset_threads="", optimize_jobs=False,
+        #                             video_encoder=self.video_encoder)
+        #         self.node_list[self].add(worker)
+        #     for node in mapped_threads['numa_nodes']:
+        #         job_core_tracker = 0
+        #         taskset_threads = "taskset --cpu-list "
+        #         for core in mapped_threads['numa_nodes'][node]['cores']:
+        #             for thread in mapped_threads['numa_nodes'][node]['cores'][core]['threads']:
+        #                 taskset_threads += f"{thread},"
+        #             job_core_tracker += 1
+        #             if job_core_tracker == optimized_core_count:
+        #                 taskset_threads = taskset_threads[:-1]
+        #                 worker = NodeWorker(self, taskset_threads=taskset_threads, optimize_jobs=self.optimize_jobs,
+        #                                     video_encoder=self.video_encoder)
+        #                 self.node_list[self].add(worker)
+        #                 worker.start()
+        #                 job_core_tracker = 0
+        #                 taskset_threads = "taskset --cpu-list "
+        #                 print(self.node_list)
+        # else:  # run one worker per node with whatever default settings the codec has regarding scaling
+        #     worker = NodeWorker(self, taskset_threads="", optimize_jobs=self.optimize_jobs,
+        #                         video_encoder=self.video_encoder)
+        #     self.node_list[self].add(worker)
 
-            else:  # run one worker per node with whatever default settings the codec has regarding scaling
-                worker = NodeWorker(self, taskset_threads="", optimize_jobs=self.optimize_jobs,
-                                    video_encoder=self.video_encoder)
-                self.worker_list[self].add(worker)
+        while len(self.segment_list) > 0:
+            self.segment_list_lock.acquire()
+            # you have to use .keys for a managed list... Because... Because you just do, okay?!
+            for key in self.segment_list.keys():
+                print(self.segment_list[key])
 
 
 class NodeWorker(mp.Process):
@@ -407,11 +414,17 @@ class VideoSegment:
         self.encode_job = encode_job
         self.segment_start = frame_to_timestamp(segment_start, self.encode_job.framerate)
         self.segment_end = frame_to_timestamp(segment_end, self.encode_job.framerate)
-        self.assigned = False
         self.num_frames = num_frames
         self.file_output_fstring = (f"{self.encode_job.out_path}/{self.encode_job.preset['name']}/temp/"
                                     f"{self.encode_job.filename}/{self.segment_start}-{self.segment_end}_"
                                     f"{self.encode_job.filename}")
+
+    # required to index objects in managed dictionaries without exe crashing to desktop
+    def __hash__(self) -> int:
+        return hash(self.file_output_fstring)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, VideoSegment) and self.file_output_fstring == other.file_output_fstring
 
     def check_if_exists(self, mux_info_queue: mp.Queue[str]) -> bool:
         cmd = [
@@ -435,13 +448,18 @@ class VideoSegment:
         else:
             return False
 
-    def encode(self, hostname: str, current_user: str, stdout_queue: mp.Queue[str]) -> tuple[int, str | Exception]:
-        cmd = (
-            f'ffmpeg -ss {self.segment_start} -to {self.segment_end} -i '
-            f'\"{self.encode_job.input_file}\" '
-            f"{self.ffmpeg_video_string} "
-            f'\"{self.file_output_fstring}\"'
-        )
+    def encode(self, hostname: str, current_user: str, stdout_queue: mp.Queue[str],
+               pool_threads: int) -> tuple[int, str | Exception]:
+        cmd = (f'ffmpeg -ss {self.segment_start} -to {self.segment_end} -i \\"{self.encode_job.input_file}\\" -c:v '
+               f'{self.encode_job.preset['video_encoder']} {self.encode_job.preset['ffmpeg_video_params']} ')
+
+        if self.encode_job.preset['video_encoder'] == 'libx265':
+            cmd += f'-x265-params "{self.encode_job.preset['encoder_params']}'
+            if self.encode_job.preset['optimize_jobs']:
+                cmd += f':pmode=1:frame-threads=1:pools=\'{pool_threads}\'" \\"{self.file_output_fstring}\\"'
+
+            else:
+                cmd += f' \\"{self.file_output_fstring}\\"'
 
         return_code, stderr = execute_cmd_ssh(cmd, hostname, current_user, stdout_queue, get_pty=True)
 
@@ -718,8 +736,6 @@ def get_cpu_info(hostname: str, username: str,
         if str(thread['cpu']) not in mapped_threads['numa_nodes'][node]['cores'][str(thread['core'])]['threads']:
             mapped_threads['numa_nodes'][node]['cores'][str(thread['core'])]['threads'].add(str(thread['cpu']))
 
-    print(mapped_threads)
-
     # noinspection PyUnboundLocalVariable
     return avx512, mapped_threads
 
@@ -741,16 +757,12 @@ def main() -> None:
     print(args.out_path)
 
     manager = mp.Manager()
-    worker_list = manager.dict()
 
     job_list = manager.list()
+    job_list_lock = mp.Manager().Lock()
 
     segment_list = manager.dict()
-    segment_list_lock = mp.Lock()
-
-    # for worker_hostname in config['nodes']:
-    #     worker_list.update({NodeManager(hostname=worker_hostname, current_user=current_user, worker_list=worker_list,
-    #                                     job_list=job_list, job_list_lock=job_list_lock): set()}, optimize_jobs=config['optimize_jobs'], video_)
+    segment_list_lock = mp.Manager().Lock()
 
     for path in config['additional_content']:
         config['additional_content'][path]['file_list'] = sorted(os.listdir(path))
@@ -761,17 +773,31 @@ def main() -> None:
             job_list += [EncodeJob(input_file=file_fullpath, preset=preset, out_path=args.out_path, filename=file,
                                    additional_content=config['additional_content'], file_index=x)]
 
+    # temporary sorted list cuz sorted doesn't return a listproxy
+    sorted_jobs = sorted(job_list, key=lambda job: job.job_name)
+    job_list[:] = [job for job in sorted_jobs if not job.check_if_exists()]
 
-
-    job_list = sorted(job_list, key=lambda job: job.job_name)
-    job_list[:] = [job for job in job_list if not job.check_if_exists()]
-    job_segment_list = []
     for jobs in job_list:
-        job_segment_list += jobs.create_segment_encode_list()
+        segment_templist = jobs.create_segment_encode_list()
+        for segment in segment_templist:
+            segment_list.update({segment: {'Assigned': False}})
 
-    print("it's over")
+    print(type(segment_list))
 
-    # job_handler(job_segment_list, worker_list)
+    node_list = []
+
+    for worker_hostname in config['nodes']:
+        node_list += [NodeManager(hostname=worker_hostname, current_user=current_user,
+                                      job_list=job_list, job_list_lock=job_list_lock, segment_list=segment_list,
+                                      segment_list_lock=segment_list_lock)]
+
+    for node in node_list:
+        node.start()
+
+    # job_handler(job_segment_list, node_list)
+
+    while True:
+        time.sleep(10)
 
 
 if __name__ == "__main__":
