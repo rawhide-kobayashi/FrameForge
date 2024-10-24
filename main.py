@@ -201,15 +201,67 @@ class NodeManager(mp.Process):
         self.job_list_lock = job_list_lock
         self.segment_list = segment_list
         self.segment_list_lock = segment_list_lock
+        self.manager = mp.Manager()
+        self.start()
 
     def run(self) -> None:
 
         avx512 = None
         mapped_threads = None
+        worker_list: set[NodeWorker] = set()
 
-        while not isinstance(avx512, bool) and not isinstance(mapped_threads, dict):
+        while not isinstance(avx512, bool) or not isinstance(mapped_threads, dict):
             avx512, mapped_threads = get_cpu_info(self.hostname, self.current_user, self.stdout_queue)
-            print(avx512, mapped_threads)
+
+        shareable_threads = self.manager.dict()
+
+        shareable_threads['numa_nodes'] = self.manager.dict()
+
+        for numa_node in mapped_threads['numa_nodes']:
+            shareable_threads['numa_nodes'][numa_node] = self.manager.dict()
+            shareable_threads['numa_nodes'][numa_node]['cores'] = self.manager.list()
+            shareable_threads['numa_nodes'][numa_node]['cores_available'] = 0
+            for core in mapped_threads['numa_nodes'][numa_node]['cores']:
+                shareable_threads['numa_nodes'][numa_node]['cores'].append(
+                    CPUCore(core, mapped_threads['numa_nodes'][numa_node]['cores'][core]['threads'], self.manager))
+                shareable_threads['numa_nodes'][numa_node]['cores_available'] += 1
+
+        while len(self.segment_list) > 0:
+            self.segment_list_lock.acquire()
+            # you have to use .keys for a managed list... Because... Because you just do, okay?!
+            for numa_node in shareable_threads['numa_nodes'].keys():
+                for segment in self.segment_list.keys():
+                    if not self.segment_list[segment]['assigned']:
+                        if segment.encode_job.preset['optimize_jobs']:
+                            # optimized core counts for other codecs coming when I care (or if someone tells me)
+                            if segment.encode_job.preset['video_encoder'] == 'libx265':
+                                optimal_cores = 4
+
+                            if shareable_threads['numa_nodes'][numa_node]['cores_available'] >= optimal_cores:
+                                core_list = self.manager.list()
+                                for core in shareable_threads['numa_nodes'][numa_node]['cores']:
+                                    if len(core_list) < optimal_cores:
+                                        if not core.assigned.value:
+                                            core_list.append(core)
+                                            core.assigned.value = True
+                                            shareable_threads['numa_nodes'][numa_node]['cores_available'] -= 1
+                                    else:
+                                        worker_list.add(NodeWorker(node_info=self, shareable_threads=shareable_threads,
+                                                                   core_list=core_list, segment=segment))
+                                        self.segment_list[segment]['assigned'] = True
+                                        break
+
+                                for core in core_list:
+                                    print(f"{self.hostname}, {core.core_id}, {core.threads}, {core.assigned.value}")
+
+                                print(shareable_threads['numa_nodes'][numa_node]['cores_available'])
+
+                            else:
+                                break
+
+            self.segment_list_lock.release()
+            time.sleep(1)
+
 
         # I've only figured out the optimal core count for x265, which is four, with one frame thread, for optimal
         # speed and encoding efficiency. I have not tested optimal settings for other codecs or encoders yet.
@@ -245,27 +297,11 @@ class NodeManager(mp.Process):
         #                         video_encoder=self.video_encoder)
         #     self.node_list[self].add(worker)
 
-        while len(self.segment_list) > 0:
-            self.segment_list_lock.acquire()
-            # you have to use .keys for a managed list... Because... Because you just do, okay?!
-            for segment in self.segment_list.keys():
-                if not self.segment_list[segment]['assigned']:
-                    if segment.encode_job.preset['optimize_jobs']:
-                        for numa_node in mapped_threads['numa_nodes']:
-                            core_list =
-                            for core in mapped_threads['numa_nodes'][numa_node]['cores']
-
-
-
 
 class NodeWorker(mp.Process):
-    def __init__(self, node_info: NodeManager, taskset_threads: str, optimize_jobs: bool, video_encoder: str) -> None:
+    def __init__(self, node_info: NodeManager, shareable_threads: mp.managers.DictProxy[str, Any],
+                 core_list: mp.managers.ListProxy[CPUCore], segment: VideoSegment) -> None:
         super().__init__()
-        self.manager = mp.Manager()
-        self.current_segment = self.manager.Namespace()
-        self.current_segment.value = None
-        self.is_running = self.manager.Namespace()
-        self.is_running.value = False
         # by "any" of course, I mean, mp.Manager.Value, but I couldn't figure out how to make mypy happy
         self.stdout_queue: mp.Queue[str] = mp.Queue()
         self.stderr_queue: mp.Queue[tuple[Any, int, str | Exception]] = mp.Queue()
@@ -274,18 +310,33 @@ class NodeWorker(mp.Process):
         self.err_timestamp = 0.0
 
         self.node_info = node_info
+        self.shareable_threads = shareable_threads
+        self.core_list = core_list
+        self.segment = segment
+        self.start()
 
     def run(self) -> None:
-        while not self.shutdown.value:
-            if time.time() - self.err_timestamp > 30:
-                self.err_cooldown.value = False
+        # while not self.shutdown.value:
+        #     if time.time() - self.err_timestamp > 30:
+        #         self.err_cooldown.value = False
+#
+        #     if self.current_segment.value is not None and self.is_running.value:
+        #         returncode, stderr = self.execute_encode(segment_to_encode=self.current_segment.value)
+        #         self.stderr_queue.put((self.current_segment.value, returncode, stderr))
+        #         self.is_running.value = False
+#
+        #     time.sleep(1)
+        print("HEYYYYYYYY BOY")
 
-            if self.current_segment.value is not None and self.is_running.value:
-                returncode, stderr = self.execute_encode(segment_to_encode=self.current_segment.value)
-                self.stderr_queue.put((self.current_segment.value, returncode, stderr))
-                self.is_running.value = False
+        time.sleep(1)
 
-            time.sleep(1)
+        for numa_node in self.shareable_threads['numa_nodes'].keys():
+            for core in self.core_list:
+                if core in self.shareable_threads['numa_nodes'][numa_node]['cores']:
+                    core.assigned.value = False
+                    self.shareable_threads['numa_nodes'][numa_node]['cores_available'] += 1
+                    print("free core!")
+
         self.close()
 
     def execute_encode(self, segment_to_encode: VideoSegment) -> tuple[int, str | Exception]:
@@ -658,19 +709,6 @@ def get_cpu_info(hostname: str, username: str,
     print(hostname)
     avx512_dict: dict[Any, Any] = {}
     core_info_dict: dict[Any, Any] = {}
-    # mypy giving me grief at the end of this function if I define it as dict[str, bool | set[str]] whatever
-    mapped_threads: dict[str, dict[str, dict[str, dict[str, dict[str, Any]]]]] = {
-        'numa_nodes': {
-            '0': {
-                'cores': {
-                    '0': {
-                        'assigned': False,
-                        'threads': {'0'}
-                    }
-                }
-            }
-        }
-    }
 
     # tragic: for no apparent reason, paramiko randomly returns a very, very small fraction of the full stdout
     # so, we simply retry until we get uncorrupted json :)
@@ -711,7 +749,6 @@ def get_cpu_info(hostname: str, username: str,
                 print(f"Failed to connect to {hostname}.")
                 break
 
-            # print(json.loads(core_info_stdout))
             core_info_dict = json.loads(core_info_stdout)
 
         except json.decoder.JSONDecodeError:
@@ -719,6 +756,18 @@ def get_cpu_info(hostname: str, username: str,
 
     # Restructure the returned thread data. This is the only way to properly deal with asymmetrical CPUs that have
     # cores with variable thread counts, and it makes NUMA easier.
+
+    mapped_threads: dict[str, dict[str, dict[str, dict[str, dict[str, set[str]]]]]] = {
+        'numa_nodes': {
+            '0': {
+                'cores': {
+                    '0': {
+                        'threads': {'0'}
+                    }
+                }
+            }
+        }
+    }
 
     for thread in core_info_dict['cpus']:
         node = str(thread['node']) if 'node' in thread else '0'
@@ -729,7 +778,6 @@ def get_cpu_info(hostname: str, username: str,
                     'cores': {
                         str(thread['core']): {
                             'threads': {
-                                'assigned': False,
                                 str(thread['cpu'])
                             }
                         }
@@ -740,7 +788,6 @@ def get_cpu_info(hostname: str, username: str,
         if str(thread['core']) not in mapped_threads['numa_nodes'][node]['cores']:
             mapped_threads['numa_nodes'][node]['cores'].update({
                 str(thread['core']): {
-                    'assigned': False,
                     'threads': {
                         str(thread['cpu'])
                     }
@@ -753,11 +800,18 @@ def get_cpu_info(hostname: str, username: str,
     # noinspection PyUnboundLocalVariable
     return avx512, mapped_threads
 
+
 class CPUCore:
-    def __init__(self, core_id: str) -> None:
+    def __init__(self, core_id: str, threads: tuple[int, ...], manager: mp.managers.SyncManager) -> None:
         self.core_id = core_id
-        self.assigned = False
-        self.threads = set()
+        self.threads = threads
+        self.assigned = manager.Value('b', False)
+
+    def __hash__(self) -> int:
+        return hash(self.core_id)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, CPUCore) and self.core_id == other.core_id
 
 
 def main() -> None:
@@ -802,17 +856,12 @@ def main() -> None:
         for segment in segment_templist:
             segment_list.update({segment: {'assigned': False}})
 
-    print(type(segment_list))
-
     node_list = []
 
     for worker_hostname in config['nodes']:
         node_list += [NodeManager(hostname=worker_hostname, current_user=current_user,
                                       job_list=job_list, job_list_lock=job_list_lock, segment_list=segment_list,
                                       segment_list_lock=segment_list_lock)]
-
-    for node in node_list:
-        node.start()
 
     # job_handler(job_segment_list, node_list)
 
