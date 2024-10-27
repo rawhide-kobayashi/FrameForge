@@ -4,6 +4,8 @@ import argparse
 import os
 import subprocess
 import multiprocessing as mp
+# importing this separately makes mypy happy for some reason
+import multiprocessing.managers
 import time
 import re
 import math
@@ -19,6 +21,7 @@ from datetime import datetime
 from typing import Any, cast
 import json
 from multiprocessing.synchronize import Lock as TypedLock
+import sys
 
 
 def load_config(file_path: str) -> dict[str, Any]:
@@ -141,12 +144,13 @@ class MuxWorker(mp.Process):
                                                                                                   False):
                                 mkvmerge_mux_string += f'--original-flag 0 '
 
-                            mkvmerge_mux_string += (f"""--audio-tracks 0 --language 0:{self.additional_content[path]
-                            [content_type]['audio'][track_id]['lang']} --track-name 0:"{self.additional_content[path]
-                            [content_type]['audio'][track_id]['track_name']}" {mux_audio_only} "{self.out_path}/
-                            {self.preset['name']}/temp/{self.filename}/audio_{track_id}_{self.additional_content[path]
-                            [content_type]['audio'][track_id]['lang']}_{self.additional_content[path][content_type]
-                            ['audio'][track_id]['track_name']}_{self.filename}" """)
+                            mkvmerge_mux_string += (f"--audio-tracks 0 --language 0:"
+                            f"{self.additional_content[path][content_type]['audio'][track_id]['lang']} --track-name "
+                            f"0:\"{self.additional_content[path][content_type]['audio'][track_id]['track_name']}\" "
+                            f"{mux_audio_only} \"{self.out_path}/{self.preset['name']}/temp/{self.filename}/audio_"
+                            f"{track_id}_{self.additional_content[path][content_type]['audio'][track_id]['lang']}_"
+                            f"{self.additional_content[path][content_type]['audio'][track_id]['track_name']}_"
+                            f"{self.filename}\" ")
 
                 if 'subtitles' in self.additional_content[path][content_type]:
                     for track_id in self.additional_content[path][content_type]['subtitles']:
@@ -189,29 +193,29 @@ class MuxWorker(mp.Process):
 
 
 class NodeManager(mp.Process):
-    def __init__(self, hostname: str, current_user: str,
+    def __init__(self, hostname: str, ssh_username: str,
                  job_list: mp.managers.ListProxy[EncodeJob], job_list_lock: TypedLock,
                  segment_list: mp.managers.DictProxy[VideoSegment, dict[str, bool]],
-                 segment_list_lock: TypedLock) -> None:
+                 segment_list_lock: TypedLock, stderr_queue: mp.Queue[tuple[str, tuple[int, str | Exception]]]) -> None:
         super().__init__()
         self.hostname = hostname
-        self.current_user = current_user
-        self.stdout_queue: mp.Manager().Queue[str] = mp.Manager().Queue()
+        self.ssh_username = ssh_username
+        self.stdout_queue: mp.Queue[str] = mp.Queue()
+        self.stderr_queue = stderr_queue
         self.job_list = job_list
         self.job_list_lock = job_list_lock
         self.segment_list = segment_list
         self.segment_list_lock = segment_list_lock
+        self.avx512: bool | Exception | None = None
         self.manager = mp.Manager()
         self.start()
 
     def run(self) -> None:
-
-        avx512 = None
         mapped_threads = None
         worker_list: set[NodeWorker] = set()
 
-        while not isinstance(avx512, bool) or not isinstance(mapped_threads, dict):
-            avx512, mapped_threads = get_cpu_info(self.hostname, self.current_user, self.stdout_queue)
+        while not isinstance(self.avx512, bool) or not isinstance(mapped_threads, dict):
+            self.avx512, mapped_threads = get_cpu_info(self.hostname, self.ssh_username, self.stdout_queue)
 
         shareable_threads = self.manager.dict()
 
@@ -228,6 +232,26 @@ class NodeManager(mp.Process):
 
         while len(self.segment_list) > 0:
             self.segment_list_lock.acquire()
+
+            # YOU WILL NOT CHANGE THE LENGTH OF A LIST WHILE ITERATING OVER IT
+            worker_del_list = []
+
+            for worker in worker_list:
+                if worker.is_alive():
+                    #while not worker.stdout_queue.empty():
+                    test = "1"
+
+                elif not worker.stderr_queue.empty():
+                    while not worker.stderr_queue.empty():
+                        print(worker.stderr_queue.get())
+                    worker_del_list.append(worker)
+
+                else:
+                    worker_del_list.append(worker)
+
+            for worker in worker_del_list:
+                worker_list.remove(worker)
+
             # you have to use .keys for a managed list... Because... Because you just do, okay?!
             for numa_node in shareable_threads['numa_nodes'].keys():
                 for segment in self.segment_list.keys():
@@ -236,6 +260,9 @@ class NodeManager(mp.Process):
                             # optimized core counts for other codecs coming when I care (or if someone tells me)
                             if segment.encode_job.preset['video_encoder'] == 'libx265':
                                 optimal_cores = 4
+
+                            else:
+                                optimal_cores = len(shareable_threads['numa_nodes'][numa_node]['cores'])
 
                             if shareable_threads['numa_nodes'][numa_node]['cores_available'] >= optimal_cores:
                                 core_list = self.manager.list()
@@ -246,69 +273,28 @@ class NodeManager(mp.Process):
                                             core.assigned.value = True
                                             shareable_threads['numa_nodes'][numa_node]['cores_available'] -= 1
                                     else:
-                                        worker_list.add(NodeWorker(node_info=self, shareable_threads=shareable_threads,
-                                                                   core_list=core_list, segment=segment))
-                                        self.segment_list[segment]['assigned'] = True
                                         break
 
-                                for core in core_list:
-                                    print(f"{self.hostname}, {core.core_id}, {core.threads}, {core.assigned.value}")
-
-                                print(shareable_threads['numa_nodes'][numa_node]['cores_available'])
+                                worker_list.add(NodeWorker(node_info=self, shareable_threads=shareable_threads,
+                                                           core_list=core_list, segment=segment,
+                                                           stderr_queue=self.stderr_queue))
+                                # reassign the entire dict value rather than the bool alone because... that's what works
+                                self.segment_list[segment] = {'assigned': True}
 
                             else:
                                 break
 
             self.segment_list_lock.release()
-            time.sleep(1)
-
-
-        # I've only figured out the optimal core count for x265, which is four, with one frame thread, for optimal
-        # speed and encoding efficiency. I have not tested optimal settings for other codecs or encoders yet.
-        # if self.optimize_jobs:
-        #     if self.video_encoder == 'libx265' and len(mapped_threads['numa_nodes']['0']['cores']) >= 4:
-        #         optimized_core_count = 4
-        #     # who the hell still runs machines with <4 cores though
-        #     elif self.video_encoder == 'libx265' and len(mapped_threads['numa_nodes']['0']['cores']) < 4:
-        #         optimized_core_count = len(mapped_threads['numa_nodes']['0']['cores'])
-        #     # default behavior for encoders/codecs with undetermined thread optimization
-        #     else:
-        #         worker = NodeWorker(self, taskset_threads="", optimize_jobs=False,
-        #                             video_encoder=self.video_encoder)
-        #         self.node_list[self].add(worker)
-        #     for node in mapped_threads['numa_nodes']:
-        #         job_core_tracker = 0
-        #         taskset_threads = "taskset --cpu-list "
-        #         for core in mapped_threads['numa_nodes'][node]['cores']:
-        #             for thread in mapped_threads['numa_nodes'][node]['cores'][core]['threads']:
-        #                 taskset_threads += f"{thread},"
-        #             job_core_tracker += 1
-        #             if job_core_tracker == optimized_core_count:
-        #                 taskset_threads = taskset_threads[:-1]
-        #                 worker = NodeWorker(self, taskset_threads=taskset_threads, optimize_jobs=self.optimize_jobs,
-        #                                     video_encoder=self.video_encoder)
-        #                 self.node_list[self].add(worker)
-        #                 worker.start()
-        #                 job_core_tracker = 0
-        #                 taskset_threads = "taskset --cpu-list "
-        #                 print(self.node_list)
-        # else:  # run one worker per node with whatever default settings the codec has regarding scaling
-        #     worker = NodeWorker(self, taskset_threads="", optimize_jobs=self.optimize_jobs,
-        #                         video_encoder=self.video_encoder)
-        #     self.node_list[self].add(worker)
+            time.sleep(0.1)
 
 
 class NodeWorker(mp.Process):
     def __init__(self, node_info: NodeManager, shareable_threads: mp.managers.DictProxy[str, Any],
-                 core_list: mp.managers.ListProxy[CPUCore], segment: VideoSegment) -> None:
+                 core_list: mp.managers.ListProxy[CPUCore], segment: VideoSegment,
+                 stderr_queue: mp.Queue[tuple[str, tuple[int, str | Exception]]]) -> None:
         super().__init__()
-        # by "any" of course, I mean, mp.Manager.Value, but I couldn't figure out how to make mypy happy
         self.stdout_queue: mp.Queue[str] = mp.Queue()
-        self.stderr_queue: mp.Queue[tuple[Any, int, str | Exception]] = mp.Queue()
-        self.shutdown = mp.Value('b', False)
-        self.err_cooldown = mp.Value('b', False)
-        self.err_timestamp = 0.0
-
+        self.stderr_queue = stderr_queue
         self.node_info = node_info
         self.shareable_threads = shareable_threads
         self.core_list = core_list
@@ -316,154 +302,149 @@ class NodeWorker(mp.Process):
         self.start()
 
     def run(self) -> None:
-        # while not self.shutdown.value:
-        #     if time.time() - self.err_timestamp > 30:
-        #         self.err_cooldown.value = False
-#
-        #     if self.current_segment.value is not None and self.is_running.value:
-        #         returncode, stderr = self.execute_encode(segment_to_encode=self.current_segment.value)
-        #         self.stderr_queue.put((self.current_segment.value, returncode, stderr))
-        #         self.is_running.value = False
-#
-        #     time.sleep(1)
-        print("HEYYYYYYYY BOY")
+        if self.segment.encode_job.preset['optimize_jobs']:
+            pool_threads = 0
+            taskset_threads = "taskset --cpu-list "
+            for core in self.core_list:
+                for thread in core.threads:
+                    taskset_threads += f"{thread},"
+                    pool_threads += 1
 
-        time.sleep(1)
+            taskset_threads = taskset_threads[:-1]
+
+            self.stderr_queue.put((self.node_info.hostname,
+                                   self.segment.encode(hostname=self.node_info.hostname,
+                                                       username=self.node_info.ssh_username,
+                                                       stdout_queue=self.stdout_queue, pool_threads=pool_threads,
+                                                       avx512=cast(bool, self.node_info.avx512),
+                                                       taskset_threads=taskset_threads)))
 
         for numa_node in self.shareable_threads['numa_nodes'].keys():
             for core in self.core_list:
                 if core in self.shareable_threads['numa_nodes'][numa_node]['cores']:
                     core.assigned.value = False
                     self.shareable_threads['numa_nodes'][numa_node]['cores_available'] += 1
-                    print("free core!")
 
         self.close()
 
-    def execute_encode(self, segment_to_encode: VideoSegment) -> tuple[int, str | Exception]:
-        returncode, stderr = segment_to_encode.encode(self.node_info.hostname, self.node_info.current_user,
-                                                      stdout_queue=self.stdout_queue)
-        if not returncode == 0:
-            self.err_timestamp = time.time()
-        return returncode, stderr
 
-
-class RichHelper:
-    def __init__(self, worker_list: list[NodeManager], segment_list: list[VideoSegment],
-                 mux_info_queue: mp.Queue[str]) -> None:
-        self.worker_list = worker_list
-        self.segment_list = segment_list
-        self.total_frames = 0
-        self.cumulative_frames = 0
-        self.init_time = time.time()
-        self.mux_info_queue = mux_info_queue
-        self.worker_cum_values: dict[NodeManager, dict[str, float | int]] = {}
-        self.worker_last_values: dict[NodeManager, dict[str, float | int]] = {}
-        self.worker_avg_values: dict[NodeManager, dict[str, float]] = {}
-        self.worker_cur_values: dict[NodeManager, dict[str, float | int | str]] = {}
-        # was I planning on using these?
-        # self.worker_status_header: dict[EncodeWorker, str] = {}
-        # self.worker_status_stderr: dict[EncodeWorker.stderr_queue] = {}
-        self.mux_strings_list = [""] * 8
-        self.stderr_strings_list = [""] * 8
-
-        for worker in self.worker_list:
-            self.worker_cum_values[worker] = {'Frame': 0, 'FPS': 0.0, '%RT': 0.0, 'accumulation': 0}
-            self.worker_last_values[worker] = {'Frame': 0, 'FPS': 0.0, '%RT': 0.0}
-            self.worker_avg_values[worker] = {'FPS': 0.0, '%RT': 0.0}
-            self.worker_cur_values[worker] = {'Frame': 0, 'FPS': 0.0, '%RT': 0.0, 'Status': "Idle"}
-
-        for segment in self.segment_list:
-            self.total_frames += segment.num_frames
-
-        # use case for this variable?
-        # worker_stdout_strings = [""] * len(self.worker_list)
-
-    def update_stderr(self, hostname: str, stderr: tuple[Any, int, str | Exception]) -> str:
-        stderr_text = ""
-        self.stderr_strings_list.append(f"{datetime.now().strftime('%H:%M:%S')} {hostname}: "
-                                        f"{str(stderr[2]).splitlines()[-1]}")
-
-        if len(self.stderr_strings_list) > 8:
-            self.stderr_strings_list.pop(0)
-
-        for x in range(len(self.stderr_strings_list)):
-            stderr_text += self.stderr_strings_list[x]
-            stderr_text += "\n"
-
-        return stderr_text
-
-    def update_mux_info(self, mux_info_queue: mp.Queue[str]) -> str:
-        mux_text = ""
-        new_mux_string = mux_info_queue.get()
-        new_mux_prefix = new_mux_string.split(':')[0]
-        # print(new_mux_prefix)
-        # print(self.mux_strings_list[7])
-        if self.mux_strings_list[7].startswith(new_mux_prefix):
-            self.mux_strings_list[7] = new_mux_string
-        else:
-            self.mux_strings_list.append(new_mux_string)
-
-        if len(self.mux_strings_list) > 8:
-            self.mux_strings_list.pop(0)
-
-        for x in range(len(self.mux_strings_list)):
-            mux_text += self.mux_strings_list[x]
-            mux_text += "\n"
-
-        return mux_text
-
-    def create_node_table(self) -> Table:
-        table = Table(title=tqdm.tqdm.format_meter(n=self.cumulative_frames, total=self.total_frames,
-                                                   elapsed=time.time() - self.init_time, unit='frames'))
-        table.add_column(header="Hostname", min_width=16)
-        table.add_column(header="Status", min_width=5)
-        table.add_column(header="# Frames", min_width=8)
-        table.add_column(header="Avg FPS", min_width=7)
-        table.add_column(header="Avg %RT", min_width=7)
-
-        for worker in self.worker_list:
-            table.add_row(worker.hostname, self.worker_cur_values[worker]['Status'],
-                          str(self.worker_cum_values[worker]['Frame']), str(self.worker_avg_values[worker]['FPS']),
-                          f"{self.worker_avg_values[worker]['%RT']}x")
-
-        return table
-
-    def update_worker_status(self, worker: NodeManager, status: str) -> None:
-        match = re.search(pattern=r'frame=\s*(\d+)\s*fps=\s*([\d\.]+)\s*q=.*?size=\s*([\d\.]+\s*[KMG]i?B)\s*time=.*?bit'
-                                  r'rate=\s*([\d\.]+kbits/s)\s*speed=\s*([\d\.x]+)', string=status)
-        if match:
-            self.worker_cur_values[worker]['Status'] = "OK"
-            self.worker_cur_values[worker]['Frame'] = int(match.group(1))
-            self.worker_cur_values[worker]['FPS'] = float(match.group(2))
-            self.worker_cur_values[worker]['%RT'] = float(match.group(5)[:-1])
-            for stat in self.worker_cur_values[worker]:
-                try:
-                    if stat == 'Frame':
-                        if not (cast(int, self.worker_cur_values[worker][stat]) ==
-                                cast(int, self.worker_last_values[worker][stat])):
-                            if (cast(int, self.worker_cur_values[worker][stat]) >
-                                    cast(int, self.worker_last_values[worker][stat])):
-                                self.cumulative_frames += (cast(int, self.worker_cur_values[worker][stat]) -
-                                                           cast(int, self.worker_last_values[worker][stat]))
-                                self.worker_cum_values[worker][stat] += (
-                                        cast(int, self.worker_cur_values[worker][stat]) -
-                                        cast(int, self.worker_last_values[worker][stat]))
-                    elif not stat == 'Status':
-                        self.worker_avg_values[worker][stat] = round((cast(int | float,
-                                                                           self.worker_cur_values[worker][stat]) +
-                                                                      self.worker_cum_values[worker][stat]) /
-                                                                     self.worker_cum_values[worker]['accumulation'], 3)
-                        self.worker_cum_values[worker][stat] += cast(int | float, self.worker_cur_values[worker][stat])
-
-                except ZeroDivisionError:
-                    continue
-
-                self.worker_last_values[worker][stat] = cast(float | int, self.worker_cur_values[worker][stat])
-
-            self.worker_cum_values[worker]['accumulation'] += 1
-
-        elif re.search(pattern=r'Press \[q\] to stop, \[\?\] for help', string=status):
-            self.worker_cur_values[worker]['Status'] = "Seek"
+# class RichHelper:
+#     def __init__(self, worker_list: list[NodeManager], segment_list: list[VideoSegment],
+#                  mux_info_queue: mp.Queue[str]) -> None:
+#         self.worker_list = worker_list
+#         self.segment_list = segment_list
+#         self.total_frames = 0
+#         self.cumulative_frames = 0
+#         self.init_time = time.time()
+#         self.mux_info_queue = mux_info_queue
+#         self.worker_cum_values: dict[NodeManager, dict[str, float | int]] = {}
+#         self.worker_last_values: dict[NodeManager, dict[str, float | int]] = {}
+#         self.worker_avg_values: dict[NodeManager, dict[str, float]] = {}
+#         self.worker_cur_values: dict[NodeManager, dict[str, float | int | str]] = {}
+#         # was I planning on using these?
+#         # self.worker_status_header: dict[EncodeWorker, str] = {}
+#         # self.worker_status_stderr: dict[EncodeWorker.stderr_queue] = {}
+#         self.mux_strings_list = [""] * 8
+#         self.stderr_strings_list = [""] * 8
+#
+#         for worker in self.worker_list:
+#             self.worker_cum_values[worker] = {'Frame': 0, 'FPS': 0.0, '%RT': 0.0, 'accumulation': 0}
+#             self.worker_last_values[worker] = {'Frame': 0, 'FPS': 0.0, '%RT': 0.0}
+#             self.worker_avg_values[worker] = {'FPS': 0.0, '%RT': 0.0}
+#             self.worker_cur_values[worker] = {'Frame': 0, 'FPS': 0.0, '%RT': 0.0, 'Status': "Idle"}
+#
+#         for segment in self.segment_list:
+#             self.total_frames += segment.num_frames
+#
+#         # use case for this variable?
+#         # worker_stdout_strings = [""] * len(self.worker_list)
+#
+#     def update_stderr(self, hostname: str, stderr: tuple[Any, int, str | Exception]) -> str:
+#         stderr_text = ""
+#         self.stderr_strings_list.append(f"{datetime.now().strftime('%H:%M:%S')} {hostname}: "
+#                                         f"{str(stderr[2]).splitlines()[-1]}")
+#
+#         if len(self.stderr_strings_list) > 8:
+#             self.stderr_strings_list.pop(0)
+#
+#         for x in range(len(self.stderr_strings_list)):
+#             stderr_text += self.stderr_strings_list[x]
+#             stderr_text += "\n"
+#
+#         return stderr_text
+#
+#     def update_mux_info(self, mux_info_queue: mp.Queue[str]) -> str:
+#         mux_text = ""
+#         new_mux_string = mux_info_queue.get()
+#         new_mux_prefix = new_mux_string.split(':')[0]
+#         # print(new_mux_prefix)
+#         # print(self.mux_strings_list[7])
+#         if self.mux_strings_list[7].startswith(new_mux_prefix):
+#             self.mux_strings_list[7] = new_mux_string
+#         else:
+#             self.mux_strings_list.append(new_mux_string)
+#
+#         if len(self.mux_strings_list) > 8:
+#             self.mux_strings_list.pop(0)
+#
+#         for x in range(len(self.mux_strings_list)):
+#             mux_text += self.mux_strings_list[x]
+#             mux_text += "\n"
+#
+#         return mux_text
+#
+#     def create_node_table(self) -> Table:
+#         table = Table(title=tqdm.tqdm.format_meter(n=self.cumulative_frames, total=self.total_frames,
+#                                                    elapsed=time.time() - self.init_time, unit='frames'))
+#         table.add_column(header="Hostname", min_width=16)
+#         table.add_column(header="Status", min_width=5)
+#         table.add_column(header="# Frames", min_width=8)
+#         table.add_column(header="Avg FPS", min_width=7)
+#         table.add_column(header="Avg %RT", min_width=7)
+#
+#         for worker in self.worker_list:
+#             table.add_row(worker.hostname, self.worker_cur_values[worker]['Status'],
+#                           str(self.worker_cum_values[worker]['Frame']), str(self.worker_avg_values[worker]['FPS']),
+#                           f"{self.worker_avg_values[worker]['%RT']}x")
+#
+#         return table
+#
+#     def update_worker_status(self, worker: NodeManager, status: str) -> None:
+#         match = re.search(pattern=r'frame=\s*(\d+)\s*fps=\s*([\d\.]+)\s*q=.*?size=\s*([\d\.]+\s*[KMG]i?B)\s*time=.*?bit'
+#                                   r'rate=\s*([\d\.]+kbits/s)\s*speed=\s*([\d\.x]+)', string=status)
+#         if match:
+#             self.worker_cur_values[worker]['Status'] = "OK"
+#             self.worker_cur_values[worker]['Frame'] = int(match.group(1))
+#             self.worker_cur_values[worker]['FPS'] = float(match.group(2))
+#             self.worker_cur_values[worker]['%RT'] = float(match.group(5)[:-1])
+#             for stat in self.worker_cur_values[worker]:
+#                 try:
+#                     if stat == 'Frame':
+#                         if not (cast(int, self.worker_cur_values[worker][stat]) ==
+#                                 cast(int, self.worker_last_values[worker][stat])):
+#                             if (cast(int, self.worker_cur_values[worker][stat]) >
+#                                     cast(int, self.worker_last_values[worker][stat])):
+#                                 self.cumulative_frames += (cast(int, self.worker_cur_values[worker][stat]) -
+#                                                            cast(int, self.worker_last_values[worker][stat]))
+#                                 self.worker_cum_values[worker][stat] += (
+#                                         cast(int, self.worker_cur_values[worker][stat]) -
+#                                         cast(int, self.worker_last_values[worker][stat]))
+#                     elif not stat == 'Status':
+#                         self.worker_avg_values[worker][stat] = round((cast(int | float,
+#                                                                            self.worker_cur_values[worker][stat]) +
+#                                                                       self.worker_cum_values[worker][stat]) /
+#                                                                      self.worker_cum_values[worker]['accumulation'], 3)
+#                         self.worker_cum_values[worker][stat] += cast(int | float, self.worker_cur_values[worker][stat])
+#
+#                 except ZeroDivisionError:
+#                     continue
+#
+#                 self.worker_last_values[worker][stat] = cast(float | int, self.worker_cur_values[worker][stat])
+#
+#             self.worker_cum_values[worker]['accumulation'] += 1
+#
+#         elif re.search(pattern=r'Press \[q\] to stop, \[\?\] for help', string=status):
+#             self.worker_cur_values[worker]['Status'] = "Seek"
 
 
 class VideoSegment:
@@ -505,33 +486,36 @@ class VideoSegment:
         else:
             return False
 
-    def encode(self, hostname: str, current_user: str, stdout_queue: mp.Queue[str],
-               pool_threads: int, avx512: bool) -> tuple[int, str | Exception]:
-        cmd = (f'ffmpeg -ss {self.segment_start} -to {self.segment_end} -i \\"{self.encode_job.input_file}\\" -c:v '
-               f'{self.encode_job.preset['video_encoder']} {self.encode_job.preset['ffmpeg_video_params']} ')
+    def encode(self, hostname: str, username: str, stdout_queue: mp.Queue[str],
+               pool_threads: int, avx512: bool, taskset_threads: str = "") -> tuple[int, str | Exception]:
+        cmd = (f'{taskset_threads} ffmpeg -ss {self.segment_start} -to {self.segment_end} -i \"'
+               f'{self.encode_job.input_file}\" -c:v {self.encode_job.preset['video_encoder']} '
+               f'{self.encode_job.preset['ffmpeg_video_params']} ')
 
         if self.encode_job.preset['video_encoder'] == 'libx265':
-            cmd += f'-x265-params "{self.encode_job.preset['encoder_params']}'
+            cmd += f'-x265-params \"{self.encode_job.preset['encoder_params']}'
 
             if avx512:
                 cmd += f':asm=avx512'
 
             if self.encode_job.preset['optimize_jobs']:
-                cmd += f':pmode=1:frame-threads=1:pools=\'{pool_threads}\'" \\"{self.file_output_fstring}\\"'
+                cmd += f':pmode=1:frame-threads=1:pools=\'{pool_threads}\'\" \"{self.file_output_fstring}\"'
 
             else:
-                cmd += f' \\"{self.file_output_fstring}\\"'
+                cmd += f'\" \"{self.file_output_fstring}\"'
 
-        return_code, stderr = execute_cmd_ssh(cmd, hostname, current_user, stdout_queue, get_pty=True)
+        return_code, stderr = execute_cmd_ssh(cmd=cmd, hostname=hostname, username=username, stdout_queue=stdout_queue,
+                                              get_pty=True)
 
-        # paramiko can only get ffmpeg stdout with get_pty=True... But it can only get stderr with get_pty=False...
+        # # paramiko can only get ffmpeg stdout with get_pty=True... But it can only get stderr with get_pty=False...
         if not return_code == 0:
-            return_code, stderr = execute_cmd_ssh(cmd, hostname, current_user, stdout_queue, get_pty=False)
+            return_code, stderr = execute_cmd_ssh(cmd=cmd, hostname=hostname, username=username,
+                                                  stdout_queue=stdout_queue, get_pty=False)
 
         return return_code, stderr
 
 
-def execute_cmd_ssh(cmd: str, hostname: str, username: str, stdout_queue: mp.Queue[str], get_pty: bool,
+def execute_cmd_ssh(cmd: str, hostname: str, username: str, get_pty: bool, stdout_queue: mp.Queue[str] = mp.Queue(),
                     prefix: str = "") -> tuple[int, str | Exception]:
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -545,20 +529,13 @@ def execute_cmd_ssh(cmd: str, hostname: str, username: str, stdout_queue: mp.Que
 
     client.invoke_shell()
     stdin, stdout, stderr = client.exec_command(cmd, get_pty=get_pty)
-    try:
-        line = b''
-        while not stdout.channel.exit_status_ready() or stdout.channel.recv_ready():
-            for byte in iter(lambda: stdout.read(1), b""):
-                line += byte
-                if byte == b'\n' or byte == b'\r':
-                    stdout_queue.put(f"{prefix}{line.decode('utf-8', errors='replace').rstrip()}")
-                    line = b''
-    except KeyboardInterrupt:
-        kill_cmd = (
-            f'pkill -9 -f {cmd}'
-        )
-        client.exec_command(kill_cmd)
-        client.close()
+    line = b''
+    while not stdout.channel.exit_status_ready() or stdout.channel.recv_ready():
+        for byte in iter(lambda: stdout.read(1), b""):
+            line += byte
+            if byte == b'\n' or byte == b'\r':
+                stdout_queue.put(f"{prefix}{line.decode('utf-8', errors='replace').rstrip()}")
+                line = b''
 
     client.close()
     return stdout.channel.recv_exit_status(), stderr.read().decode('utf-8')
@@ -631,77 +608,77 @@ class EncodeJob:
         return segment_list
 
 
-def job_handler(segment_list: list[VideoSegment], worker_list: list[NodeManager]) -> None:
-
-    mux_info_queue: mp.Queue[str] = mp.Queue()
-
-    segment_list[:] = [segment for segment in segment_list if not segment.check_if_exists(mux_info_queue)]
-
-    tui = RichHelper(worker_list, segment_list, mux_info_queue)
-    layout = Layout()
-    # layout.split_column(Layout(name="header", size=4), Layout(name="table"), Layout(name="footer", size=8))
-    layout.split_column(Layout(name="table"), Layout(name="stderr", size=10), Layout(name="Mux Info", size=10))
-    layout['table'].update(tui.create_node_table())
-
-    layout['stderr'].update(Panel("Nothing here yet!", title="Errors"))
-    layout['Mux Info'].update(Panel("Nothing here yet...", title="Mux Info"))
-
-    segment_index = 0
-    # I put this here for a reason, maybe, but I don't remember what
-    # mux_string_arr = []
-    with Live(layout, refresh_per_second=1, screen=True):
-        while len(segment_list) > 0:
-            while segment_list[segment_index].assigned and segment_index + 1 < len(segment_list):
-                segment_index += 1
-            for worker in worker_list:
-                if (worker.current_segment.value is None or not worker.is_running.value) and not \
-                        worker.err_cooldown.value:
-                    if not worker.stderr_queue.empty():
-                        results = worker.stderr_queue.get()
-                        if results[1] == 0:
-                            for segment in segment_list:
-                                if segment.uuid == results[0].uuid:
-                                    segment.encode_job.tally_completed_segments(segment.file_output_fstring,
-                                                                                mux_info_queue)
-                                    segment_list.remove(segment)
-                                    tui.worker_cur_values[worker]['Status'] = "Idle"
-                                    break
-                        else:
-                            for segment in segment_list:
-                                if segment.uuid == results[0].uuid:
-                                    segment.assigned = False
-                                    worker.err_cooldown.value = True
-                            layout['stderr'].update(Panel(tui.update_stderr(worker.hostname, results), title="stderr"))
-                            tui.worker_cur_values[worker]['Status'] = "Error"
-                        worker.current_segment.value = None
-                    else:
-                        try:
-                            if not segment_list[segment_index].assigned:
-                                worker.current_segment.value = segment_list[segment_index]
-                                worker.is_running.value = True
-                                segment_list[segment_index].assigned = True
-                                segment_index += 1
-                        except IndexError:
-                            continue
-                elif not worker.stdout_queue.empty():
-                    tui.update_worker_status(worker, worker.stdout_queue.get())
-            segment_index = 0
-            layout['table'].update(tui.create_node_table())
-            if not mux_info_queue.empty():
-                layout['Mux Info'].update(Panel(tui.update_mux_info(mux_info_queue), title="Mux Info"))
-            time.sleep(0.01)
-
-    for worker in worker_list:
-        worker.shutdown.value = True
-        worker.join()
-
-    mux_workers = [x for x in mp.active_children() if x.name.startswith('mux_worker')]
-
-    for mux in mux_workers:
-        while mux.is_alive():
-            if not mux_info_queue.empty():
-                print(mux_info_queue.get())
-            time.sleep(0.01)
+# def job_handler(segment_list: list[VideoSegment], worker_list: list[NodeManager]) -> None:
+#
+#     mux_info_queue: mp.Queue[str] = mp.Queue()
+#
+#     segment_list[:] = [segment for segment in segment_list if not segment.check_if_exists(mux_info_queue)]
+#
+#     tui = RichHelper(worker_list, segment_list, mux_info_queue)
+#     layout = Layout()
+#     # layout.split_column(Layout(name="header", size=4), Layout(name="table"), Layout(name="footer", size=8))
+#     layout.split_column(Layout(name="table"), Layout(name="stderr", size=10), Layout(name="Mux Info", size=10))
+#     layout['table'].update(tui.create_node_table())
+#
+#     layout['stderr'].update(Panel("Nothing here yet!", title="Errors"))
+#     layout['Mux Info'].update(Panel("Nothing here yet...", title="Mux Info"))
+#
+#     segment_index = 0
+#     # I put this here for a reason, maybe, but I don't remember what
+#     # mux_string_arr = []
+#     with Live(layout, refresh_per_second=1, screen=True):
+#         while len(segment_list) > 0:
+#             while segment_list[segment_index].assigned and segment_index + 1 < len(segment_list):
+#                 segment_index += 1
+#             for worker in worker_list:
+#                 if (worker.current_segment.value is None or not worker.is_running.value) and not \
+#                         worker.err_cooldown.value:
+#                     if not worker.stderr_queue.empty():
+#                         results = worker.stderr_queue.get()
+#                         if results[1] == 0:
+#                             for segment in segment_list:
+#                                 if segment.uuid == results[0].uuid:
+#                                     segment.encode_job.tally_completed_segments(segment.file_output_fstring,
+#                                                                                 mux_info_queue)
+#                                     segment_list.remove(segment)
+#                                     tui.worker_cur_values[worker]['Status'] = "Idle"
+#                                     break
+#                         else:
+#                             for segment in segment_list:
+#                                 if segment.uuid == results[0].uuid:
+#                                     segment.assigned = False
+#                                     worker.err_cooldown.value = True
+#                             layout['stderr'].update(Panel(tui.update_stderr(worker.hostname, results), title="stderr"))
+#                             tui.worker_cur_values[worker]['Status'] = "Error"
+#                         worker.current_segment.value = None
+#                     else:
+#                         try:
+#                             if not segment_list[segment_index].assigned:
+#                                 worker.current_segment.value = segment_list[segment_index]
+#                                 worker.is_running.value = True
+#                                 segment_list[segment_index].assigned = True
+#                                 segment_index += 1
+#                         except IndexError:
+#                             continue
+#                 elif not worker.stdout_queue.empty():
+#                     tui.update_worker_status(worker, worker.stdout_queue.get())
+#             segment_index = 0
+#             layout['table'].update(tui.create_node_table())
+#             if not mux_info_queue.empty():
+#                 layout['Mux Info'].update(Panel(tui.update_mux_info(mux_info_queue), title="Mux Info"))
+#             time.sleep(0.01)
+#
+#     for worker in worker_list:
+#         worker.shutdown.value = True
+#         worker.join()
+#
+#     mux_workers = [x for x in mp.active_children() if x.name.startswith('mux_worker')]
+#
+#     for mux in mux_workers:
+#         while mux.is_alive():
+#             if not mux_info_queue.empty():
+#                 print(mux_info_queue.get())
+#             time.sleep(0.01)
 
 
 def get_cpu_info(hostname: str, username: str,
@@ -714,7 +691,8 @@ def get_cpu_info(hostname: str, username: str,
     # so, we simply retry until we get uncorrupted json :)
     while len(avx512_dict) == 0:
         try:
-            avx512_info = execute_cmd_ssh("lscpu --json", hostname, username, stdout_queue, get_pty=True)
+            avx512_info = execute_cmd_ssh(cmd="lscpu --json", hostname=hostname, username=username,
+                                          stdout_queue=stdout_queue, get_pty=True)
             avx512_stdout = ""
             if avx512_info[0] == 0:
                 while not stdout_queue.empty():
@@ -738,7 +716,8 @@ def get_cpu_info(hostname: str, username: str,
 
     while len(core_info_dict) == 0:
         try:
-            core_info = execute_cmd_ssh("lscpu --json --extended", hostname, username, stdout_queue, get_pty=True)
+            core_info = execute_cmd_ssh(cmd="lscpu --json --extended", hostname=hostname, username=username,
+                                        stdout_queue=stdout_queue, get_pty=True)
             core_info_stdout = ""
             if core_info[0] == 0:
                 while not stdout_queue.empty():
@@ -757,12 +736,12 @@ def get_cpu_info(hostname: str, username: str,
     # Restructure the returned thread data. This is the only way to properly deal with asymmetrical CPUs that have
     # cores with variable thread counts, and it makes NUMA easier.
 
-    mapped_threads: dict[str, dict[str, dict[str, dict[str, dict[str, set[str]]]]]] = {
+    mapped_threads: dict[str, dict[str, dict[str, dict[str, dict[str, list[str]]]]]] = {
         'numa_nodes': {
             '0': {
                 'cores': {
                     '0': {
-                        'threads': {'0'}
+                        'threads': ['0']
                     }
                 }
             }
@@ -777,25 +756,37 @@ def get_cpu_info(hostname: str, username: str,
                 str(node): {
                     'cores': {
                         str(thread['core']): {
-                            'threads': {
+                            'threads': [
                                 str(thread['cpu'])
-                            }
+                            ]
                         }
                     }
                 }
             })
 
-        if str(thread['core']) not in mapped_threads['numa_nodes'][node]['cores']:
-            mapped_threads['numa_nodes'][node]['cores'].update({
-                str(thread['core']): {
-                    'threads': {
-                        str(thread['cpu'])
+        if avx512_dict['lscpu'][2]['data'] == 'Qualcomm':
+            # nonobad ugly hack due to lscpu misreporting core/thread relationships on my snapdragon x wsl install
+            # no multithreading so no need to check 2x. no clue if it would work properly on a native linux install.
+            if str(thread['cpu']) not in mapped_threads['numa_nodes'][node]['cores']:
+                mapped_threads['numa_nodes'][node]['cores'].update({
+                    str(thread['cpu']): {
+                        'threads': [
+                            str(thread['cpu'])
+                        ]
                     }
-                }
-            })
+                })
 
-        if str(thread['cpu']) not in mapped_threads['numa_nodes'][node]['cores'][str(thread['core'])]['threads']:
-            mapped_threads['numa_nodes'][node]['cores'][str(thread['core'])]['threads'].add(str(thread['cpu']))
+        else:
+            if str(thread['core']) not in mapped_threads['numa_nodes'][node]['cores']:
+                mapped_threads['numa_nodes'][node]['cores'].update({
+                    str(thread['core']): {
+                        'threads': [
+                            str(thread['cpu'])
+                        ]
+                    }
+                })
+            if str(thread['cpu']) not in mapped_threads['numa_nodes'][node]['cores'][str(thread['core'])]['threads']:
+                mapped_threads['numa_nodes'][node]['cores'][str(thread['core'])]['threads'].append(str(thread['cpu']))
 
     # noinspection PyUnboundLocalVariable
     return avx512, mapped_threads
@@ -815,7 +806,7 @@ class CPUCore:
 
 
 def main() -> None:
-    current_user = os.getlogin()
+    ssh_username = os.getlogin()
 
     parser = argparse.ArgumentParser(description="Load a YAML configuration file.")
     parser.add_argument('--config', type=str, required=True, help="Path to the YAML configuration file.")
@@ -823,12 +814,15 @@ def main() -> None:
     parser.add_argument('--out_path', type=str, required=True, help="Path to output video files.")
 
     args = parser.parse_args()
+    args.out_path = args.out_path.rstrip('/')
 
     config = load_config(args.config)
     print("Loaded configuration:")
     print(config)
     print(args.in_path)
     print(args.out_path)
+
+    stderr_queue: mp.Queue[tuple[str, tuple[int, str | Exception]]] = mp.Queue()
 
     manager = mp.Manager()
 
@@ -859,14 +853,26 @@ def main() -> None:
     node_list = []
 
     for worker_hostname in config['nodes']:
-        node_list += [NodeManager(hostname=worker_hostname, current_user=current_user,
-                                      job_list=job_list, job_list_lock=job_list_lock, segment_list=segment_list,
-                                      segment_list_lock=segment_list_lock)]
+        node_list += [NodeManager(hostname=worker_hostname, ssh_username=ssh_username,
+                                  job_list=job_list, job_list_lock=job_list_lock, segment_list=segment_list,
+                                  segment_list_lock=segment_list_lock, stderr_queue=stderr_queue)]
 
     # job_handler(job_segment_list, node_list)
 
     while True:
-        time.sleep(10)
+        try:
+            time.sleep(10)
+
+        except KeyboardInterrupt:
+            kill_cmd = (
+                f'pgrep -f \"ffmpeg.*{args.in_path}.*{args.out_path}\" | xargs kill -9'
+            )
+            for node in node_list:
+                node.kill()
+                node.join()
+
+                execute_cmd_ssh(cmd=kill_cmd, hostname=node.hostname, username=node.ssh_username, get_pty=True)
+            sys.exit()
 
 
 if __name__ == "__main__":
