@@ -1,7 +1,10 @@
 nodes:
-  - hostname: node1.local.domain
-  - hostname: node2.whateverdomain
-  - hostname: 104.135.233.98
+  'node1.local.domain'
+    cores: auto
+  'hostname: node2.whateverdomain'
+    cores: 6 # limitations on core usage not yet implemented
+  'hostname: 104.135.233.98'
+    cores: 4
 
 additional_content:
   '/mnt/content/containing/subtitles/to/mux/':
@@ -64,11 +67,28 @@ additional_content:
 
 presets:
   - name: 1080p_placebo
-    ffmpeg_video_string: '-c:v libx265 -preset placebo -tune animation -pix_fmt yuv444p10 -profile:v main444-10-intra -x265-params "bframes=16:psy-rd=2.4:psy-rdoq=4:aq-mode=4:qcomp=0.8:no-sao=1:deblock=-1,-1:ref=6:pmode=1" -crf 22 -y'
-    ffmpeg_audio_string: '-vn -sn -dn -c:v copy -async 1'
+    # exact encoder name as you would pass it to ffmpeg in -c:v
+    video_encoder: libx265
+    # encoder params ensconced withing the -encodername-params "params" section in ffmpeg
+    encoder_params: 'bframes=16:psy-rd=2.4:psy-rdoq=4:aq-mode=4:qcomp=0.8:no-sao=1:deblock=-1,-1:ref=6'
+    # other ffmpeg params
+    ffmpeg_video_params: '-preset placebo -tune animation -pix_fmt yuv444p10 -profile:v main444-10 -crf 8 -y'
+    # separate ffmpeg params for audio re-encode passes
+    ffmpeg_audio_params: '-vn -sn -dn -c:v copy -async 1'
+    # whether or not to hyperscale parallel jobs within a given node
+    optimize_jobs: True
+    frames_per_segment: 400
   - name: 1080p_normal
-    ffmpeg_video_string: '-c:v libx265 -preset placebo -tune animation -pix_fmt yuv420p10 -profile:v main10 -x265-params "bframes=16:psy-rd=1.6:psy-rdoq=2:aq-mode=4:qcomp=0.8:limit-sao=1:deblock=-1,-1:ref=6:pmode=1" -crf 18 -y'
-    ffmpeg_audio_string: '-vn -sn -dn -c:a libopus -b:a 192k -async 1'
+    video_encoder: libx265
+    encoder_params: 'bframes=16:psy-rd=1.6:psy-rdoq=2:aq-mode=4:qcomp=0.8:limit-sao=1:deblock=-1,-1:ref=6'
+    ffmpeg_video_params: '-preset placebo -tune animation -pix_fmt yuv420p10 -profile:v main10 -crf 18 -y'
+    ffmpeg_audio_params: '-vn -sn -dn -c:a libopus -b:a 192k -async 1'
+    optimize_jobs: True
+    frames_per_segment: 400
   - name: 720p_cringe
-    ffmpeg_video_string: '-c:v libx265 -preset placebo -tune animation -pix_fmt yuv420p10 -profile:v main10 -x265-params "bframes=16:psy-rd=0.8:psy-rdoq=1:aq-mode=4:qcomp=0.8:ref=6:pmode=1" -vf scale=1280:720 -sws_flags spline -crf 24 -y'
-    ffmpeg_audio_string: '-vn -sn -dn -c:a libopus -b:a 128k -async 1'
+    video_encoder: libx265
+    encoder_params: 'bframes=16:psy-rd=0.8:psy-rdoq=1:aq-mode=4:qcomp=0.8:ref=6'
+    ffmpeg_video_params: '-preset placebo -tune animation -pix_fmt yuv420p10 -profile:v main10 -vf scale=1280:720 -sws_flags spline -crf 24 -y'
+    ffmpeg_audio_params: '-vn -sn -dn -c:a libopus -b:a 64k -async 1'
+    optimize_jobs: True
+    frames_per_segment: 400
