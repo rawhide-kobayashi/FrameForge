@@ -1,4 +1,7 @@
 from __future__ import annotations
+
+import random
+
 import yaml
 import argparse
 import os
@@ -16,12 +19,45 @@ from rich.table import Table  # type: ignore
 from rich.layout import Layout  # type: ignore
 from rich.panel import Panel  # type: ignore
 from rich import print  # type: ignore
+from rich.progress import Progress, ProgressColumn, SpinnerColumn, TextColumn, MofNCompleteColumn, TimeRemainingColumn, Text  # type: ignore
 import paramiko
 from datetime import datetime
 from typing import Any, cast
 import json
 from threading import Lock as TypedLock
 import sys
+
+
+class TransferSpeedColumnFPS(ProgressColumn):  # type: ignore
+    """Renders human-readable transfer speed... in FPS!"""
+
+    def render(self, task: "Task") -> Text:
+        """Show data transfer speed."""
+        speed = task.finished_speed or task.speed
+        if speed is None:
+            return Text("?", style="progress.data.speed")
+        data_speed = round(speed, 3)
+        return Text(f"{data_speed} FPS", style="progress.data.speed")
+
+
+class TextMarquee:
+    def __init__(self, string: str, width: int) -> None:
+        self.string = list(string)
+        self.marquee_scroller: list[int] = [i - 1 for i in range(width)]
+        self.marquee_string = ""
+
+    def advance(self) -> str:
+        for x in range(len(self.marquee_scroller)):
+            if self.marquee_scroller[x] + 1 < len(self.string):
+                self.marquee_scroller[x] += 1
+            else:
+                self.marquee_scroller[x] = 0
+
+        marquee_string = ""
+        for x in range(len(self.marquee_scroller)):
+            marquee_string += self.string[self.marquee_scroller[x]]
+
+        return marquee_string
 
 
 def load_config(file_path: str) -> dict[str, Any]:
@@ -210,7 +246,8 @@ class NodeManager(mp.Process):
     def __init__(self, hostname: str, ssh_username: str,
                  job_list: mp.managers.ListProxy[EncodeJob], job_list_lock: TypedLock,
                  segment_list: mp.managers.DictProxy[VideoSegment, dict[str, bool]],
-                 segment_list_lock: TypedLock, stderr_queue: mp.Queue[tuple[str, tuple[int, str | Exception]]]) -> None:
+                 segment_list_lock: TypedLock, stderr_queue: mp.Queue[tuple[str, tuple[int, str | Exception]]],
+                 color: str, segment_progress_update_queue: mp.Queue[tuple[VideoSegment, str, int]]) -> None:
         super().__init__()
         self.hostname = hostname
         self.ssh_username = ssh_username
@@ -223,6 +260,8 @@ class NodeManager(mp.Process):
         self.avx512: bool | Exception | None = None
         self.manager = mp.Manager()
         self.init_timestamp = time.time()
+        self.color = color
+        self.segment_progress_update_queue = segment_progress_update_queue
 
         self.stats: dict[str, dict[str, Any]] = {
             'cumulative_values': {
@@ -289,6 +328,9 @@ class NodeManager(mp.Process):
                         if not worker.stats['cur_values']['Frames'] == worker.stats['last_values']['Frames']:
                             self.stats['cumulative_values']['Frames'].value += (worker.stats['cur_values']['Frames'] -
                                                                                 worker.stats['last_values']['Frames'])
+                            self.segment_progress_update_queue.put((worker.segment, 'update',
+                                                                    worker.stats['cur_values']['Frames'] -
+                                                                    worker.stats['last_values']['Frames'], self.color))
                             worker.stats['last_values']['Frames'] = worker.stats['cur_values']['Frames']
 
                         for metric in ['FPS', '%RT']:
@@ -352,7 +394,10 @@ class NodeManager(mp.Process):
                                                                core_list=core_list, segment=segment))
                                     # reassign the entire dict value rather than the bool alone because... that's what
                                     # works with shared dicts
-                                    self.segment_list[segment] = {'assigned': True}
+                                    self.segment_list[segment] = {
+                                        'assigned': True
+                                    }
+                                    self.segment_progress_update_queue.put((segment, 'create', 0, self.color))
 
                                 else:
                                     break
@@ -434,6 +479,10 @@ class RichHelper:
         self.mux_strings_list = [""] * 8
         self.stderr_strings_list = [""] * 8
 
+        self.global_progress = Progress(SpinnerColumn(), *Progress.get_default_columns(), MofNCompleteColumn(),
+                                        TransferSpeedColumnFPS())
+        self.global_progress_bar = self.global_progress.add_task("Total Progress", total=self.total_frames)
+
     def update_stderr(self, stderr_queue: mp.Queue[tuple[str, tuple[int, str | Exception]]]) -> str:
         stderr_text = ""
         stderr = stderr_queue.get()
@@ -464,24 +513,64 @@ class RichHelper:
     def create_node_table(self) -> Table:
         for node in self.node_list:
             if node.stats['cumulative_values']['Frames'].value > self.node_last_frames_value[node]:
-                self.cumulative_frames += (node.stats['cumulative_values']['Frames'].value -
-                                           self.node_last_frames_value[node])
+                frame_diff = node.stats['cumulative_values']['Frames'].value - self.node_last_frames_value[node]
+                self.cumulative_frames += frame_diff
                 self.node_last_frames_value[node] = node.stats['cumulative_values']['Frames'].value
+                self.global_progress.update(self.global_progress_bar, advance=frame_diff)
 
-        table = Table(title=tqdm.tqdm.format_meter(n=self.cumulative_frames, total=self.total_frames,
-                                                   elapsed=time.time() - self.init_time, unit='frames'))
+        # table = Table(title=tqdm.tqdm.format_meter(n=self.cumulative_frames, total=self.total_frames,
+        #                                           elapsed=time.time() - self.init_time, unit='frames'))
+
+        table = Table(title=self.global_progress)
         table.add_column(header="Hostname", min_width=16)
         table.add_column(header="# Frames", min_width=8)
         table.add_column(header="Avg FPS", min_width=7)
         table.add_column(header="Avg %RT", min_width=7)
         for node in self.node_list:
-            table.add_row(node.hostname, str(node.stats['cumulative_values']['Frames'].value),
+            table.add_row(f'[{node.color}]{node.hostname}',
+                          str(node.stats['cumulative_values']['Frames'].value),
                           str(node.stats['avg_values']['FPS'].value), f"{node.stats['avg_values']['%RT'].value}x")
         return table
 
-    def update_worker_status(self, worker: NodeManager, status: str) -> None:
-        if re.search(pattern=r'Press \[q\] to stop, \[\?\] for help', string=status):
-            self.worker_cur_values[worker]['Status'] = "Seek"
+    def create_segment_progress_table(self, segment_progress_update_queue: mp.Queue[tuple[VideoSegment, str, int]],
+                                      segment_progress_bar_dict: dict[VideoSegment, dict[str, Progress | int]]
+                                      ) -> Table:
+
+        # print(os.get_terminal_size().columns)
+        table = Table.grid(expand=True)
+        table.add_column()
+        table.add_column()
+        table.add_column()
+        table.add_column()
+
+        while not segment_progress_update_queue.empty():
+            segment, command, frame_input, color = segment_progress_update_queue.get()
+            if command == 'create':
+                segment_progress_bar_dict[segment]['bar_color'] = color
+                segment_progress_bar_dict[segment]['bar_id'] = segment_progress_bar_dict[segment]['bar_obj'].add_task(
+                    description=f'[{segment_progress_bar_dict[segment]['bar_color']}]'
+                                f'{segment_progress_bar_dict[segment]['bar_marquee'].advance()}',
+                    total=segment.num_frames)
+            elif command == 'update':
+                segment_progress_bar_dict[segment]['bar_obj'].update(
+                    segment_progress_bar_dict[segment]['bar_id'],
+                    description=f'[{segment_progress_bar_dict[segment]['bar_color']}]'
+                                f'{segment_progress_bar_dict[segment]['bar_marquee'].advance()}', advance=frame_input)
+
+        temp_column_list = []
+
+        for segment in self.segment_list.keys():
+            if self.segment_list[segment]['assigned']:
+                # table.add_row(segment_progress_bar_dict[segment]['bar_obj'])
+                temp_column_list.append(segment_progress_bar_dict[segment]['bar_obj'])
+                if len(temp_column_list) == 3:
+                    table.add_row(*temp_column_list)
+                    temp_column_list = []
+
+        if len(temp_column_list) > 0:
+            table.add_row(*temp_column_list)
+
+        return table
 
 
 class VideoSegment:
@@ -493,6 +582,9 @@ class VideoSegment:
         self.file_output_fstring = (f"{self.encode_job.out_path}/{self.encode_job.preset['name']}/temp/"
                                     f"{self.encode_job.filename}/{self.segment_start}-{self.segment_end}_"
                                     f"{self.encode_job.filename}")
+
+        self.marquee_string = (f'   <-- {self.encode_job.preset['name']}/temp/{self.encode_job.filename}/'
+                               f'{self.segment_start}-{self.segment_end}_{self.encode_job.filename} -->   ')
 
     # required to index objects in managed dictionaries without exe crashing to desktop
     def __hash__(self) -> int:
@@ -673,8 +765,8 @@ def get_cpu_info(hostname: str, username: str,
                     avx512_stdout += stdout_queue.get()
 
             elif avx512_info[0] == -1:
-                print(avx512_info[1])
-                print(f"Failed to connect to {hostname}.")
+                # print(avx512_info[1])
+                # print(f"Failed to connect to {hostname}.")
                 return cast(Exception, avx512_info[1]), core_info_dict
 
             avx512_dict = json.loads(avx512_stdout)
@@ -833,44 +925,68 @@ def main() -> None:
 
     for jobs in job_list:
         segment_temp_list = jobs.create_segment_encode_list()
-        segment_list.update({segment: {'assigned': False} for segment in segment_temp_list if not
-                             segment.check_if_exists(current_user=ssh_username)})
+        segment_list.update({
+            segment: {
+                'assigned': False
+            } for segment in segment_temp_list if not segment.check_if_exists(current_user=ssh_username)})
+
+    segment_progress_update_queue: mp.Queue[tuple[VideoSegment, str, int]] = manager.Queue()
+    segment_progress_bar_dict = {}
+
+    for segment in segment_list.keys():
+        segment_progress_bar_dict.update({
+            segment: {
+                'bar_obj': Progress(SpinnerColumn(), TextColumn("{task.description}"), TimeRemainingColumn(),
+                                         MofNCompleteColumn(), TransferSpeedColumnFPS()),
+                'bar_id': 0,
+                'bar_marquee': TextMarquee(segment.marquee_string, 8),
+                'bar_color': 'default'
+            }
+        })
 
     node_list = []
 
+    # nobody would ever use this with more than... fifteen... nodes, right? right? kinda based tho ngl...
+    terminal_colors = ["red", "green", "yellow", "blue", "magenta", "cyan", "white", "bright_black", "bright_red",
+                       "bright_green", "bright_yellow", "bright_blue", "bright_magenta", "bright_cyan", "bright_white"]
+
     for worker_hostname in config['nodes']:
+        randcolor = terminal_colors[random.randint(0, len(terminal_colors) - 1)]
         node_list += [NodeManager(hostname=worker_hostname, ssh_username=ssh_username,
                                   job_list=job_list, job_list_lock=job_list_lock, segment_list=segment_list,
-                                  segment_list_lock=segment_list_lock, stderr_queue=stderr_queue)]
+                                  segment_list_lock=segment_list_lock, stderr_queue=stderr_queue, color=randcolor,
+                                  segment_progress_update_queue=segment_progress_update_queue)]
+        terminal_colors.remove(randcolor)
 
     tui = RichHelper(node_list, segment_list, mux_info_queue)
     layout = Layout()
     # layout.split_column(Layout(name="header", size=4), Layout(name="table"), Layout(name="footer", size=8))
-    layout.split_column(Layout(name="table"), Layout(name="stderr", size=10), Layout(name="Mux Info", size=10))
+    layout.split_column(Layout(name="table"), Layout(name="segment_tracker"), Layout(name="stderr"),
+                        Layout(name="Mux Info"))
     layout['table'].update(tui.create_node_table())
+    layout['segment_tracker'].update(tui.create_segment_progress_table(segment_progress_update_queue,
+                                                                       segment_progress_bar_dict))
     layout['stderr'].update(Panel("Nothing here yet!", title="Errors"))
     layout['Mux Info'].update(Panel("Nothing here yet...", title="Mux Info"))
 
     try:
         with Live(layout, refresh_per_second=1, screen=True):
-            while len(segment_list) > 0:
+            mux_workers = [x for x in mp.active_children() if x.name.startswith('MuxWorker')]
+            while len(segment_list) > 0 or len(mux_workers) > 0:
                 layout['table'].update(tui.create_node_table())
+                segment_list_lock.acquire()
+                layout['segment_tracker'].update(tui.create_segment_progress_table(segment_progress_update_queue,
+                                                                                   segment_progress_bar_dict))
+                segment_list_lock.release()
                 while not mux_info_queue.empty():
                     layout['Mux Info'].update(Panel(tui.update_mux_info(mux_info_queue), title="Mux Info"))
                 while not (stderr_queue.empty()):
                     layout['stderr'].update(Panel(tui.update_stderr(stderr_queue), title="stderr"))
-                time.sleep(0.1)
+                time.sleep(1)
 
         for node in node_list:
             node.kill()
             node.join()
-
-        mux_workers = [x for x in mp.active_children() if x.name.startswith('mux_worker')]
-        for mux in mux_workers:
-            while mux.is_alive():
-                if not mux_info_queue.empty():
-                    print(mux_info_queue.get())
-                time.sleep(0.01)
 
     except KeyboardInterrupt:
         kill_cmd = (

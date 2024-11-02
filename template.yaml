@@ -74,7 +74,7 @@ presets:
     # other ffmpeg params
     ffmpeg_video_params: '-preset placebo -tune animation -pix_fmt yuv444p10 -profile:v main444-10 -crf 8 -y'
     # separate ffmpeg params for audio re-encode passes
-    ffmpeg_audio_params: '-vn -sn -dn -c:v copy -async 1'
+    ffmpeg_audio_params: '-vn -sn -dn -c:a copy -async 1'
     # whether or not to hyperscale parallel jobs within a given node
     optimize_jobs: True
     frames_per_segment: 400
