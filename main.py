@@ -12,20 +12,21 @@ import multiprocessing.managers
 import time
 import re
 import math
-import tqdm
 import select
 from rich.live import Live  # type: ignore
 from rich.table import Table  # type: ignore
 from rich.layout import Layout  # type: ignore
 from rich.panel import Panel  # type: ignore
 from rich import print  # type: ignore
-from rich.progress import Progress, ProgressColumn, SpinnerColumn, TextColumn, MofNCompleteColumn, TimeRemainingColumn, Text  # type: ignore
+from rich.progress import Progress, ProgressColumn, SpinnerColumn, TextColumn, MofNCompleteColumn  # type: ignore
+from rich.progress import TimeRemainingColumn, Text, Task
 import paramiko
 from datetime import datetime
 from typing import Any, cast
 import json
 from threading import Lock as TypedLock
 import sys
+import shutil
 
 
 class TransferSpeedColumnFPS(ProgressColumn):  # type: ignore
@@ -36,7 +37,7 @@ class TransferSpeedColumnFPS(ProgressColumn):  # type: ignore
         speed = task.finished_speed or task.speed
         if speed is None:
             return Text("?", style="progress.data.speed")
-        data_speed = round(speed, 3)
+        data_speed = round(speed, 2)
         return Text(f"{data_speed} FPS", style="progress.data.speed")
 
 
@@ -65,25 +66,25 @@ def load_config(file_path: str) -> dict[str, Any]:
         return cast(dict[str, Any], yaml.safe_load(file))
 
 
-def get_segments_and_framerate(file: str, frames_per_segment: int) -> tuple[int, float, int, int, int]:
-    framerate_command = [
+def get_framerate(file: str) -> tuple[int, int]:
+    cmd = [
         'ffprobe', '-v', 'error', '-select_streams', 'v',
         '-of', 'default=noprint_wrappers=1:nokey=1',
         '-show_entries', 'stream=avg_frame_rate', file
     ]
 
-    duration_seconds_command = [
+    return cast(tuple[int, int], map(int, subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                                         text=True).stdout.strip().split('/')))
+
+
+def get_duration(file: str) -> float:
+    cmd = [
         'ffprobe', '-v', 'error', '-select_streams', 'v',
         '-of', 'default=noprint_wrappers=1:nokey=1',
         '-show_entries', 'format=duration', file
     ]
-    framerate = subprocess.run(framerate_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    framerate_num, framerate_denom = map(int, framerate.stdout.strip().split('/'))
-    duration_seconds: float = float(subprocess.run(duration_seconds_command, stdout=subprocess.PIPE,
-                                                   stderr=subprocess.PIPE, text=True).stdout.strip())
-    return (math.ceil(int((framerate_num / framerate_denom) * duration_seconds) / frames_per_segment),
-            float(framerate_num / framerate_denom), round(duration_seconds * (framerate_num / framerate_denom)),
-            framerate_num, framerate_denom)
+
+    return float(subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout.strip())
 
 
 def frame_to_timestamp(frame: int, framerate: float) -> float:
@@ -108,10 +109,12 @@ class MuxWorker(mp.Process):
         self.mux_info_queue = mux_info_queue
         self.ssh_username = ssh_username
         self.encode_job = encode_job
+        self.mux_txt = f'{self.out_path}/temp/{self.preset['name']}/{self.filename}/mux.txt'
+        self.mux_video_path = f'{self.out_path}/temp/{self.preset['name']}/{self.filename}'
         self.start()
 
     def run(self) -> None:
-        with open(f"{self.out_path}/{self.preset['name']}/temp/{self.filename}/mux.txt", 'w') as mux:
+        with open(self.mux_txt, 'w') as mux:
             for x in self.completed_segment_filename_list:
                 mux.write(f"file '{x.replace("'", "'\\''")}'\n")
 
@@ -119,20 +122,18 @@ class MuxWorker(mp.Process):
         # I can't figure out how to get it without ssh!?
         # same BS running it twice to get stderr for ffmpeg
         ffmpeg_concat_string = (
-            f'ffmpeg -f concat -safe -0 -i '
-            f'\"{self.out_path}/{self.preset['name']}/temp/{self.filename}/mux.txt\" -c copy '
-            f'\"{self.out_path}/{self.preset['name']}/temp/{self.filename}/{self.filename}\" -y'
+            f'ffmpeg -f concat -safe -0 -i \"{self.mux_txt}\" -c copy \"{self.mux_video_path}/{self.filename}\" -y'
         )
 
         return_code, stderr = execute_cmd_ssh(cmd=ffmpeg_concat_string, hostname="localhost",
-                                              username=self.ssh_username, stdout_queue=self.mux_info_queue,
+                                              ssh_username=self.ssh_username, stdout_queue=self.mux_info_queue,
                                               get_pty=True, prefix=f'Concatenating segments for '
                                                                    f'{self.preset['name']}/{self.filename}: ')
 
         # paramiko can only get ffmpeg stdout with get_pty=True... But it can only get stderr with get_pty=False...
         if not return_code == 0:
             return_code, stderr = execute_cmd_ssh(cmd=ffmpeg_concat_string, hostname="localhost",
-                                                  username=self.ssh_username, stdout_queue=self.mux_info_queue,
+                                                  ssh_username=self.ssh_username, stdout_queue=self.mux_info_queue,
                                                   get_pty=False)
             self.mux_info_queue.put(cast(str, stderr))
             self.close()
@@ -146,11 +147,15 @@ class MuxWorker(mp.Process):
         mux_subtitles_only = "-A -D -B -T --no-chapters --no-attachments --no-global-tags"
         mux_chapters_only = "-A -D -S -B -T --no-attachments --no-global-tags"
 
+        # mkvmerge_mux_string = (f'mkvmerge -v --title "{os.path.splitext(self.filename)[0]}" -o "{self.out_path}/'
+        #                        f'{self.preset['name']}/{self.filename}" {mux_video_only} --default-duration 0:'
+        #                        f'{self.encode_job.framerate_numerator}/{self.encode_job.framerate_denominator}fps '
+        #                        f'--video-tracks 0 \"{self.out_path}/{self.preset['name']}/temp/{self.filename}/'
+        #                        f'{self.filename}\" ')
+
         mkvmerge_mux_string = (f'mkvmerge -v --title "{os.path.splitext(self.filename)[0]}" -o "{self.out_path}/'
-                               f'{self.preset['name']}/{self.filename}" {mux_video_only} --default-duration 0:'
-                               f'{self.encode_job.framerate_numerator}/{self.encode_job.framerate_denominator}fps '
-                               f'--video-tracks 0 \"{self.out_path}/{self.preset['name']}/temp/{self.filename}/'
-                               f'{self.filename}\" ')
+                               f'output/{self.preset['name']}/{self.filename}" {mux_video_only} '
+                               f'--video-tracks 0 \"{self.mux_video_path}/{self.filename}\" ')
 
         for path in self.additional_content:
             file_path = f"{path}{self.additional_content[path]['file_list'][self.file_index]}"
@@ -169,19 +174,19 @@ class MuxWorker(mp.Process):
                             track_name = self.additional_content[path][content_type]['audio'][track_id]['track_name']
 
                             ffmpeg_cmd = (f'ffmpeg -i \"{file_path}\" -map 0:{track_id} -map_metadata -{track_id} '
-                                          f'-map_chapters -{track_id} {self.preset['ffmpeg_audio_params']} \"'
-                                          f'{self.out_path}/{self.preset['name']}/temp/{self.filename}/'
-                                          f'audio_{track_id}_{track_lang}_{track_name}_{self.filename}\" -y')
+                                          f'-map_chapters -{track_id} {self.preset['ffmpeg_audio_params']} '
+                                          f'\"{self.mux_video_path}/audio_{track_id}_{track_lang}_{track_name}_'
+                                          f'{self.filename}\" -y')
 
                             return_code, stderr = execute_cmd_ssh(cmd=ffmpeg_cmd, hostname="localhost",
-                                                                  username=self.ssh_username,
+                                                                  ssh_username=self.ssh_username,
                                                                   stdout_queue=self.mux_info_queue,
                                                                   get_pty=True, prefix=f'Transcode/copy audio: '
                                                                                        f'{track_lang} - {track_name}: ')
 
                             if not return_code == 0:
                                 return_code, stderr = execute_cmd_ssh(cmd=ffmpeg_cmd, hostname="localhost",
-                                                                      username=self.ssh_username,
+                                                                      ssh_username=self.ssh_username,
                                                                       stdout_queue=self.mux_info_queue,
                                                                       get_pty=False)
                                 self.mux_info_queue.put(cast(str, stderr))
@@ -197,9 +202,8 @@ class MuxWorker(mp.Process):
                                 mkvmerge_mux_string += f'--original-flag 0 '
 
                             mkvmerge_mux_string += (f'--audio-tracks 0 --language 0:{track_lang} --track-name 0:\"'
-                                                    f'{track_name}\" {mux_audio_only} \"{self.out_path}/'
-                                                    f'{self.preset['name']}/temp/{self.filename}/audio_{track_id}_'
-                                                    f'{track_lang}_{track_name}_{self.filename}\" ')
+                                                    f'{track_name}\" {mux_audio_only} \"{self.mux_video_path}/audio_'
+                                                    f'{track_id}_{track_lang}_{track_name}_{self.filename}\" ')
 
                 if 'subtitles' in self.additional_content[path][content_type]:
                     for track_id in self.additional_content[path][content_type]['subtitles']:
@@ -237,7 +241,9 @@ class MuxWorker(mp.Process):
             self.mux_info_queue.put(f"Bad mux! {stderr}")
             self.close()
 
-        self.mux_info_queue.put(f"Good mux: {self.preset['name']}/{self.filename}")
+        else:
+            self.mux_info_queue.put(f"Good mux: {self.preset['name']}/{self.filename}")
+            shutil.rmtree(self.mux_video_path)
 
         self.close()
 
@@ -247,7 +253,7 @@ class NodeManager(mp.Process):
                  job_list: mp.managers.ListProxy[EncodeJob], job_list_lock: TypedLock,
                  segment_list: mp.managers.DictProxy[VideoSegment, dict[str, bool]],
                  segment_list_lock: TypedLock, stderr_queue: mp.Queue[tuple[str, tuple[int, str | Exception]]],
-                 color: str, segment_progress_update_queue: mp.Queue[tuple[VideoSegment, str, int]]) -> None:
+                 color: str, segment_progress_update_queue: mp.Queue[tuple[VideoSegment, str, int, Any]]) -> None:
         super().__init__()
         self.hostname = hostname
         self.ssh_username = ssh_username
@@ -306,7 +312,7 @@ class NodeManager(mp.Process):
 
         last_optimal_core_count = 0
 
-        while len(self.segment_list) > 0:
+        while True:
             # YOU WILL NOT CHANGE THE LENGTH OF A LIST WHILE ITERATING OVER IT
             worker_del_list = []
 
@@ -446,7 +452,7 @@ class NodeWorker(mp.Process):
 
             self.results_queue.put((self.node_info.hostname,
                                     self.segment.encode(hostname=self.node_info.hostname,
-                                                        username=self.node_info.ssh_username,
+                                                        ssh_username=self.node_info.ssh_username,
                                                         stdout_queue=self.stdout_queue, pool_threads=pool_threads,
                                                         avx512=cast(bool, self.node_info.avx512),
                                                         taskset_threads=taskset_threads)))
@@ -462,26 +468,26 @@ class NodeWorker(mp.Process):
 
 class RichHelper:
     def __init__(self, node_list: list[NodeManager], segment_list: mp.managers.DictProxy[VideoSegment, dict[str, bool]],
-                 mux_info_queue: mp.Queue[str]) -> None:
+                 mux_info_queue: mp.Queue[str], global_frames: multiprocessing.managers.ValueProxy[int]) -> None:
         self.node_list = node_list
         self.segment_list = segment_list
-        self.total_frames = 0
+        self.manager = mp.Manager()
+        self.global_frames = global_frames
         self.cumulative_frames = 0
         self.init_time = time.time()
         self.mux_info_queue = mux_info_queue
         self.node_last_frames_value = {}
+
         for node in self.node_list:
             self.node_last_frames_value[node] = node.stats['cumulative_values']['Frames'].value
-
-        for segment in self.segment_list.keys():
-            self.total_frames += segment.num_frames
 
         self.mux_strings_list = [""] * 8
         self.stderr_strings_list = [""] * 8
 
         self.global_progress = Progress(SpinnerColumn(), *Progress.get_default_columns(), MofNCompleteColumn(),
                                         TransferSpeedColumnFPS())
-        self.global_progress_bar = self.global_progress.add_task("Total Progress", total=self.total_frames)
+        self.global_progress_bar = self.global_progress.add_task("Total Progress",
+                                                                 total=self.global_frames.value)
 
     def update_stderr(self, stderr_queue: mp.Queue[tuple[str, tuple[int, str | Exception]]]) -> str:
         stderr_text = ""
@@ -516,12 +522,10 @@ class RichHelper:
                 frame_diff = node.stats['cumulative_values']['Frames'].value - self.node_last_frames_value[node]
                 self.cumulative_frames += frame_diff
                 self.node_last_frames_value[node] = node.stats['cumulative_values']['Frames'].value
-                self.global_progress.update(self.global_progress_bar, advance=frame_diff)
+                self.global_progress.update(self.global_progress_bar, advance=frame_diff,
+                                            total=self.global_frames.value)
 
-        # table = Table(title=tqdm.tqdm.format_meter(n=self.cumulative_frames, total=self.total_frames,
-        #                                           elapsed=time.time() - self.init_time, unit='frames'))
-
-        table = Table(title=self.global_progress)
+        table = Table(title=cast(str, self.global_progress))
         table.add_column(header="Hostname", min_width=16)
         table.add_column(header="# Frames", min_width=8)
         table.add_column(header="Avg FPS", min_width=7)
@@ -532,11 +536,10 @@ class RichHelper:
                           str(node.stats['avg_values']['FPS'].value), f"{node.stats['avg_values']['%RT'].value}x")
         return table
 
-    def create_segment_progress_table(self, segment_progress_update_queue: mp.Queue[tuple[VideoSegment, str, int]],
-                                      segment_progress_bar_dict: dict[VideoSegment, dict[str, Progress | int]]
+    def create_segment_progress_table(self, segment_progress_update_queue: mp.Queue[tuple[VideoSegment, str, int, str]],
+                                      segment_progress_bar_dict: dict[VideoSegment, dict[str, Any]]
                                       ) -> Table:
 
-        # print(os.get_terminal_size().columns)
         table = Table.grid(expand=True)
         table.add_column()
         table.add_column()
@@ -546,11 +549,27 @@ class RichHelper:
         while not segment_progress_update_queue.empty():
             segment, command, frame_input, color = segment_progress_update_queue.get()
             if command == 'create':
-                segment_progress_bar_dict[segment]['bar_color'] = color
-                segment_progress_bar_dict[segment]['bar_id'] = segment_progress_bar_dict[segment]['bar_obj'].add_task(
-                    description=f'[{segment_progress_bar_dict[segment]['bar_color']}]'
-                                f'{segment_progress_bar_dict[segment]['bar_marquee'].advance()}',
-                    total=segment.num_frames)
+                segment_progress_bar_dict.update({
+                    segment: {
+                        'bar_obj': Progress(SpinnerColumn(), TextColumn("{task.description}"),
+                                            TimeRemainingColumn(), MofNCompleteColumn(), TransferSpeedColumnFPS()),
+                        'bar_marquee': TextMarquee(segment.marquee_string, 8),
+                        'bar_color': color
+                    }
+                })
+
+                segment_progress_bar_dict.update({
+                    segment: {
+                        'bar_obj': segment_progress_bar_dict[segment]['bar_obj'],
+                        'bar_id': segment_progress_bar_dict[segment]['bar_obj'].add_task(
+                            description=f'[{segment_progress_bar_dict[segment]['bar_color']}]'
+                                        f'{segment_progress_bar_dict[segment]['bar_marquee'].advance()}',
+                            total=segment.num_frames),
+                        'bar_marquee': segment_progress_bar_dict[segment]['bar_marquee'],
+                        'bar_color': segment_progress_bar_dict[segment]['bar_color']
+                    }
+                })
+
             elif command == 'update':
                 segment_progress_bar_dict[segment]['bar_obj'].update(
                     segment_progress_bar_dict[segment]['bar_id'],
@@ -574,17 +593,19 @@ class RichHelper:
 
 
 class VideoSegment:
-    def __init__(self, segment_start: int, segment_end: int, encode_job: EncodeJob, num_frames: int) -> None:
-        self.encode_job = encode_job                                                           # ^
-        self.segment_start = frame_to_timestamp(segment_start, self.encode_job.framerate)      # ^
-        self.segment_end = frame_to_timestamp(segment_end, self.encode_job.framerate)          # ^
-        self.num_frames: int = num_frames  # why? ---------------------------------------------> ^ ???
-        self.file_output_fstring = (f"{self.encode_job.out_path}/{self.encode_job.preset['name']}/temp/"
-                                    f"{self.encode_job.filename}/{self.segment_start}-{self.segment_end}_"
-                                    f"{self.encode_job.filename}")
+    def __init__(self, encode_job: EncodeJob, source_fullpath: str) -> None:
+        self.encode_job = encode_job
+        self.source_fullpath = source_fullpath
+        self.source_filename = os.path.basename(self.source_fullpath)
+        # self.num_frames: int = num_frames  # why? ---------------------------------------------> ^ ???
+        self.file_output_fstring = (f'{self.encode_job.out_path}/temp/{self.encode_job.preset['name']}/'
+                                    f'{self.encode_job.filename}/{self.source_filename}')
 
-        self.marquee_string = (f'   <-- {self.encode_job.preset['name']}/temp/{self.encode_job.filename}/'
-                               f'{self.segment_start}-{self.segment_end}_{self.encode_job.filename} -->   ')
+        self.marquee_string: str = (f'   <-- {self.encode_job.preset['name']} - {self.encode_job.filename} - '
+                                    f'{self.source_fullpath} -->   ')
+
+        self.duration = get_duration(self.source_fullpath)
+        self.num_frames: int = round(self.duration * self.encode_job.framerate)
 
     # required to index objects in managed dictionaries without exe crashing to desktop
     def __hash__(self) -> int:
@@ -603,7 +624,10 @@ class VideoSegment:
             duration_proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             if duration_proc.returncode == 0:
                 duration = round(float(duration_proc.stdout.strip()), 3)
-                if seconds_to_frames(duration, self.encode_job.framerate) == self.num_frames:
+                frame_diff = seconds_to_frames(duration, self.encode_job.framerate) - self.num_frames
+
+                # fudge factor for fuckin bullshit ffmpeg timestamps
+                if -3 <= frame_diff <= 3:
                     self.encode_job.tally_completed_segments(self.file_output_fstring, current_user)
                     return True
                 else:
@@ -620,10 +644,9 @@ class VideoSegment:
         else:
             return False
 
-    def encode(self, hostname: str, username: str, stdout_queue: mp.Queue[str],
+    def encode(self, hostname: str, ssh_username: str, stdout_queue: mp.Queue[str],
                pool_threads: int, avx512: bool, taskset_threads: str = "") -> tuple[int, str | Exception]:
-        cmd = (f'{taskset_threads} ffmpeg -ss {self.segment_start} -to {self.segment_end} -i \"'
-               f'{self.encode_job.input_file}\" -c:v {self.encode_job.preset['video_encoder']} '
+        cmd = (f'{taskset_threads} ffmpeg -i \"{self.source_fullpath}\" -c:v {self.encode_job.preset['video_encoder']} '
                f'{self.encode_job.preset['ffmpeg_video_params']} ')
 
         if self.encode_job.preset['video_encoder'] == 'libx265':
@@ -638,24 +661,24 @@ class VideoSegment:
             else:
                 cmd += f'\" \"{self.file_output_fstring}\"'
 
-        return_code, stderr = execute_cmd_ssh(cmd=cmd, hostname=hostname, username=username, stdout_queue=stdout_queue,
-                                              get_pty=True)
+        return_code, stderr = execute_cmd_ssh(cmd=cmd, hostname=hostname, ssh_username=ssh_username,
+                                              stdout_queue=stdout_queue, get_pty=True)
 
         # # paramiko can only get ffmpeg stdout with get_pty=True... But it can only get stderr with get_pty=False...
         if not return_code == 0:
-            return_code, stderr = execute_cmd_ssh(cmd=cmd, hostname=hostname, username=username,
+            return_code, stderr = execute_cmd_ssh(cmd=cmd, hostname=hostname, ssh_username=ssh_username,
                                                   stdout_queue=stdout_queue, get_pty=False)
 
         return return_code, stderr
 
 
-def execute_cmd_ssh(cmd: str, hostname: str, username: str, get_pty: bool, stdout_queue: mp.Queue[str] = mp.Queue(),
+def execute_cmd_ssh(cmd: str, hostname: str, ssh_username: str, get_pty: bool, stdout_queue: mp.Queue[str] = mp.Queue(),
                     prefix: str = "") -> tuple[int, str | Exception]:
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
     try:
-        client.connect(hostname=hostname, username=username, key_filename=f"/home/{username}/.ssh/id_rsa.pub")
+        client.connect(hostname=hostname, username=ssh_username, key_filename=f"/home/{ssh_username}/.ssh/id_rsa.pub")
 
     except Exception as e:
         client.close()
@@ -675,16 +698,30 @@ def execute_cmd_ssh(cmd: str, hostname: str, username: str, get_pty: bool, stdou
     return stdout.channel.recv_exit_status(), stderr.read().decode('utf-8')
 
 
+class SegmenterExecutor(mp.Process):
+    def __init__(self, cmd_string: str, stdout_queue: mp.Queue[str], ssh_username: str) -> None:
+        super().__init__()
+        self.cmd_string = cmd_string
+        self.stdout_queue = stdout_queue
+        self.ssh_username = ssh_username
+        self.start()
+
+    def run(self) -> None:
+        execute_cmd_ssh(cmd=self.cmd_string, hostname='localhost', ssh_username=self.ssh_username, get_pty=True,
+                        stdout_queue=self.stdout_queue)
+
+        self.close()
+
+
 class EncodeJob:
     def __init__(self, input_file: str, preset: dict[str, str], out_path: str, filename: str,
                  additional_content: dict[str, Any], file_index: int, mux_info_queue: mp.Queue[str],
                  segment_tally_counter: mp.managers.ValueProxy[int],
-                 completed_segment_filename_list: mp.managers.ListProxy[str]) -> None:
+                 completed_segment_filename_list: mp.managers.ListProxy[str], ssh_username: str) -> None:
         self.input_file = input_file
-        self.job_name = f"{preset['name']}_{filename}"
-        self.frames_per_segment = int(preset['frames_per_segment'])
-        self.num_segments, self.framerate, self.frames_total, self.framerate_numerator, self.framerate_denominator \
-            = get_segments_and_framerate(self.input_file, self.frames_per_segment)
+        self.job_name = f'{preset['name']}_{filename}'
+        self.framerate_numerator, self.framerate_denominator = get_framerate(self.input_file)
+        self.framerate = self.framerate_numerator / self.framerate_denominator
         self.preset = preset
         self.out_path = out_path
         self.filename = filename
@@ -693,17 +730,30 @@ class EncodeJob:
         self.additional_content = additional_content
         self.mux_info_queue = mux_info_queue
         self.file_index = file_index
+        self.temp_segment_dir = f'{self.out_path}/temp/source_segments/{self.filename}/'
+        self.segment_txt = f'{self.temp_segment_dir}list.txt'
+        self.ssh_username = ssh_username
+        self.num_segments = 0
+        self.duration = get_duration(self.input_file)
+        self.frames_total = round(self.duration * self.framerate)
 
-        if not os.path.isdir(f"{self.out_path}/{self.preset['name']}/temp/{self.filename}/"):
-            os.makedirs(f"{self.out_path}/{self.preset['name']}/temp/{self.filename}/")
+        if not os.path.isdir(f'{self.out_path}/temp/source_segments/{self.filename}/'):
+            os.makedirs(f'{self.out_path}/temp/source_segments/{self.filename}/')
+
+        if not os.path.isdir(f'{self.out_path}/temp/{self.preset['name']}/{self.filename}/'):
+            os.makedirs(f'{self.out_path}/temp/{self.preset['name']}/{self.filename}/')
+
+        if not os.path.isdir(f'{self.out_path}/output/{self.preset['name']}/'):
+            os.makedirs(f'{self.out_path}/output/{self.preset['name']}/')
 
     def check_if_exists(self) -> bool:
         cmd = [
             'ffprobe', '-v', 'error', '-select_streams', 'v',
             '-of', 'default=noprint_wrappers=1:nokey=1',
-            '-show_entries', 'format=duration', f"{self.out_path}/{self.preset['name']}/{self.filename}"
+            '-show_entries', 'format=duration', f'{self.out_path}/output/{self.preset['name']}/{self.filename}'
         ]
-        if os.path.isfile(f"{self.out_path}/{self.preset['name']}/{self.filename}"):
+
+        if os.path.isfile(f'{self.out_path}/output/{self.preset['name']}/{self.filename}'):
             duration_proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             if duration_proc.returncode == 0:
                 if not duration_proc.stdout.strip() == "N/A":
@@ -711,8 +761,8 @@ class EncodeJob:
                     if seconds_to_frames(duration, self.framerate) == self.frames_total:
                         return True
                     else:
-                        print(f'expected {self.frames_total}, got {seconds_to_frames(duration, self.framerate)}')
-                        print(f'{duration}, {self.framerate}')
+                        # print(f'expected {self.frames_total}, got {seconds_to_frames(duration, self.framerate)}')
+                        # print(f'{duration}, {self.framerate}')
                         return False
                 else:
                     return False
@@ -734,18 +784,69 @@ class EncodeJob:
             MuxWorker(self.preset, self.out_path, self.filename, cast(list[str], self.completed_segment_filename_list),
                       self.additional_content, self.file_index, self.mux_info_queue, current_user, self)
 
-    def create_segment_encode_list(self) -> list[VideoSegment]:
-        segment_list = []
-        frames_assigned = 0
-        last_segment_compensation = self.frames_per_segment
-        for x in range(self.num_segments):
-            if self.frames_total - frames_assigned < self.frames_per_segment:
-                last_segment_compensation = self.frames_total - frames_assigned
-            segment_list += [VideoSegment(segment_start=x * self.frames_per_segment,
-                                          segment_end=(x + 1) * self.frames_per_segment,
-                                          encode_job=self, num_frames=last_segment_compensation)]
-            frames_assigned += self.frames_per_segment
-        return segment_list
+    def create_segment_encode_list(self, segment_list: mp.managers.DictProxy[VideoSegment, dict[str, bool]],
+                                   segment_list_lock: TypedLock,
+                                   global_frames: multiprocessing.managers.ValueProxy[int]) -> None:
+        last_line = ""
+        if os.path.exists(f'{self.segment_txt}'):
+            with open(self.segment_txt, 'r') as file:
+                lines = file.readlines()
+                if lines:
+                    last_line = lines[-1].strip()
+
+        if last_line != 'completed':
+            segment_cmd = (f'ffmpeg -i \"{self.input_file}\" -map 0 -c copy -f segment -reset_timestamps 1 '
+                           f'-segment_list_type flat -segment_time 30 -segment_list \"{self.segment_txt}\" '
+                           f'\"{self.temp_segment_dir}%05d_{self.filename}\"')
+
+            # the ssh stdout struggles will continue until morale improves
+            stdout_queue: mp.Queue[str] = mp.Queue()
+            segmenter = SegmenterExecutor(segment_cmd, stdout_queue, self.ssh_username)
+
+            while segmenter.is_alive():
+                while not stdout_queue.empty():
+                    stdout = stdout_queue.get().strip()
+                    match = re.search(r"Opening '(.+?)' for writing", stdout)
+
+                    if match:
+                        line = match.group(1)
+                        if line.endswith('list.txt'):
+                            last_line = line
+
+                        elif not last_line.endswith('list.txt'):
+                            self.add_segment(source_fullpath=last_line, segment_list=segment_list,
+                                             segment_list_lock=segment_list_lock, global_frames=global_frames)
+                            last_line = line
+                            self.num_segments += 1
+
+                        else:
+                            last_line = line
+
+            with open(self.segment_txt, 'a') as file:
+                file.write('completed')
+
+        else:
+            lines = lines[:-1]
+            self.num_segments = len(lines)
+
+            for line in lines:
+                line = line.strip()
+                self.add_segment(source_fullpath=f'{self.temp_segment_dir}{line}', segment_list=segment_list,
+                                 segment_list_lock=segment_list_lock, global_frames=global_frames)
+
+    def add_segment(self, source_fullpath: str, segment_list: mp.managers.DictProxy[VideoSegment, dict[str, bool]],
+                    segment_list_lock: TypedLock, global_frames: multiprocessing.managers.ValueProxy[int]) -> None:
+        segment = VideoSegment(encode_job=self, source_fullpath=source_fullpath)
+        if not segment.check_if_exists(current_user=self.ssh_username):
+            segment_list_lock.acquire()
+            segment_list.update({
+                segment: {
+                    'assigned': False
+                }
+            })
+            segment_list_lock.release()
+
+            global_frames.value += segment.num_frames
 
 
 def get_cpu_info(hostname: str, username: str,
@@ -757,7 +858,7 @@ def get_cpu_info(hostname: str, username: str,
     # so, we simply retry until we get uncorrupted json :)
     while len(avx512_dict) == 0:
         try:
-            avx512_info = execute_cmd_ssh(cmd="lscpu --json", hostname=hostname, username=username,
+            avx512_info = execute_cmd_ssh(cmd="lscpu --json", hostname=hostname, ssh_username=username,
                                           stdout_queue=stdout_queue, get_pty=True)
             avx512_stdout = ""
             if avx512_info[0] == 0:
@@ -778,11 +879,11 @@ def get_cpu_info(hostname: str, username: str,
     for child in avx512_dict['lscpu'][2]['children'][0]['children']:
         if child['field'] == 'Flags:':
             avx512 = True if 'avx512' in child['data'] else False
-            print(f"AVX512 Capability Detected: {avx512}")
+            # print(f"AVX512 Capability Detected: {avx512}")
 
     while len(core_info_dict) == 0:
         try:
-            core_info = execute_cmd_ssh(cmd="lscpu --json --extended", hostname=hostname, username=username,
+            core_info = execute_cmd_ssh(cmd="lscpu --json --extended", hostname=hostname, ssh_username=username,
                                         stdout_queue=stdout_queue, get_pty=True)
             core_info_stdout = ""
             if core_info[0] == 0:
@@ -790,8 +891,8 @@ def get_cpu_info(hostname: str, username: str,
                     core_info_stdout += stdout_queue.get()
 
             elif core_info[0] == -1:
-                print(core_info[1])
-                print(f"Failed to connect to {hostname}.")
+                # print(core_info[1])
+                # print(f"Failed to connect to {hostname}.")
                 break
 
             core_info_dict = json.loads(core_info_stdout)
@@ -871,6 +972,51 @@ class CPUCore:
         return isinstance(other, CPUCore) and self.core_id == other.core_id
 
 
+class JobExecutor(mp.Process):
+    def __init__(self, job_list: mp.managers.ListProxy[EncodeJob], job_list_lock: TypedLock,
+                 segment_list: mp.managers.DictProxy[VideoSegment, dict[str, bool]],
+                 segment_list_lock: TypedLock, in_path: str, out_path: str, ssh_username: str,
+                 segment_tally_list: mp.managers.ListProxy[mp.managers.ValueProxy[int]],
+                 manager: multiprocessing.managers.SyncManager, config: dict[str, Any],
+                 mux_info_queue: mp.Queue[str], global_frames: multiprocessing.managers.ValueProxy[int]) -> None:
+        super().__init__()
+        self.job_list = job_list
+        self.job_list_lock = job_list_lock
+        self.segment_list = segment_list
+        self.segment_list_lock = segment_list_lock
+        self.in_path = in_path
+        self.out_path = out_path
+        self.ssh_username = ssh_username
+        self.segment_tally_list = segment_tally_list
+        self.manager = manager
+        self.config = config
+        self.mux_info_queue = mux_info_queue
+        self.global_frames = global_frames
+        self.start()
+
+    def run(self) -> None:
+        completed_segment_filename_list = self.manager.list()
+
+        for x, file in enumerate(sorted(os.listdir(self.in_path)), start=0):
+            file_fullpath = os.path.join(self.in_path, file)
+            for preset in self.config['presets']:
+                self.segment_tally_list.append(self.manager.Value('i', 0))
+                completed_segment_filename_list.append(self.manager.list())
+                job = EncodeJob(input_file=file_fullpath, preset=preset, out_path=self.out_path, filename=file,
+                                additional_content=self.config['additional_content'], file_index=x,
+                                mux_info_queue=self.mux_info_queue, segment_tally_counter=self.segment_tally_list[-1],
+                                completed_segment_filename_list=completed_segment_filename_list[-1],
+                                ssh_username=self.ssh_username)
+
+                if not job.check_if_exists():
+                    self.job_list.append(job)
+                    job.create_segment_encode_list(self.segment_list, self.segment_list_lock, self.global_frames)
+
+                time.sleep(5)
+
+        self.close()
+
+
 def main() -> None:
     ssh_username = os.getlogin()
 
@@ -890,6 +1036,8 @@ def main() -> None:
 
     manager = mp.Manager()
 
+    global_frames = manager.Value('i', 0)
+
     # "typing" hell
     stderr_queue: mp.Queue[tuple[str, tuple[int, str | Exception]]] = manager.Queue()  # type: ignore
     mux_info_queue: mp.Queue[str] = manager.Queue()  # type: ignore
@@ -906,43 +1054,13 @@ def main() -> None:
     # shared list that contains shareable values for counting segments that are finished encoding
     segment_tally_list = manager.list()
 
-    # ditto for file names
-    completed_segment_filename_list = manager.list()
+    segment_progress_update_queue: mp.Queue[tuple[VideoSegment, str, int, Any]] = manager.Queue()  # type: ignore
+    segment_progress_bar_dict: dict[VideoSegment, dict[str, Any]] = {}
 
-    for x, file in enumerate(sorted(os.listdir(args.in_path)), start=0):
-        file_fullpath = os.path.join(args.in_path, file)
-        for preset in config['presets']:
-            segment_tally_list.append(manager.Value('i', 0))
-            completed_segment_filename_list.append(manager.list())
-            job_list += [EncodeJob(input_file=file_fullpath, preset=preset, out_path=args.out_path, filename=file,
-                                   additional_content=config['additional_content'], file_index=x,
-                                   mux_info_queue=mux_info_queue, segment_tally_counter=segment_tally_list[-1],
-                                   completed_segment_filename_list=completed_segment_filename_list[-1])]
-
-    # temporary sorted list cuz sorted doesn't return a list proxy
-    sorted_jobs = sorted(job_list, key=lambda job: job.job_name)
-    job_list[:] = [job for job in sorted_jobs if not job.check_if_exists()]
-
-    for jobs in job_list:
-        segment_temp_list = jobs.create_segment_encode_list()
-        segment_list.update({
-            segment: {
-                'assigned': False
-            } for segment in segment_temp_list if not segment.check_if_exists(current_user=ssh_username)})
-
-    segment_progress_update_queue: mp.Queue[tuple[VideoSegment, str, int]] = manager.Queue()
-    segment_progress_bar_dict = {}
-
-    for segment in segment_list.keys():
-        segment_progress_bar_dict.update({
-            segment: {
-                'bar_obj': Progress(SpinnerColumn(), TextColumn("{task.description}"), TimeRemainingColumn(),
-                                         MofNCompleteColumn(), TransferSpeedColumnFPS()),
-                'bar_id': 0,
-                'bar_marquee': TextMarquee(segment.marquee_string, 8),
-                'bar_color': 'default'
-            }
-        })
+    job_executor = JobExecutor(job_list=job_list, job_list_lock=job_list_lock, segment_list=segment_list,
+                               segment_list_lock=segment_list_lock, in_path=args.in_path, out_path=args.out_path,
+                               ssh_username=ssh_username, segment_tally_list=segment_tally_list, manager=manager,
+                               config=config, mux_info_queue=mux_info_queue, global_frames=global_frames)
 
     node_list = []
 
@@ -958,11 +1076,11 @@ def main() -> None:
                                   segment_progress_update_queue=segment_progress_update_queue)]
         terminal_colors.remove(randcolor)
 
-    tui = RichHelper(node_list, segment_list, mux_info_queue)
+    tui = RichHelper(node_list, segment_list, mux_info_queue, global_frames)
     layout = Layout()
     # layout.split_column(Layout(name="header", size=4), Layout(name="table"), Layout(name="footer", size=8))
-    layout.split_column(Layout(name="table"), Layout(name="segment_tracker"), Layout(name="stderr"),
-                        Layout(name="Mux Info"))
+    layout.split_column(Layout(name="table"), Layout(name="segment_tracker"), Layout(name="stderr", size=10),
+                        Layout(name="Mux Info", size=10))
     layout['table'].update(tui.create_node_table())
     layout['segment_tracker'].update(tui.create_segment_progress_table(segment_progress_update_queue,
                                                                        segment_progress_bar_dict))
@@ -971,8 +1089,7 @@ def main() -> None:
 
     try:
         with Live(layout, refresh_per_second=1, screen=True):
-            mux_workers = [x for x in mp.active_children() if x.name.startswith('MuxWorker')]
-            while len(segment_list) > 0 or len(mux_workers) > 0:
+            while True:
                 layout['table'].update(tui.create_node_table())
                 segment_list_lock.acquire()
                 layout['segment_tracker'].update(tui.create_segment_progress_table(segment_progress_update_queue,
@@ -984,19 +1101,22 @@ def main() -> None:
                     layout['stderr'].update(Panel(tui.update_stderr(stderr_queue), title="stderr"))
                 time.sleep(1)
 
-        for node in node_list:
-            node.kill()
-            node.join()
+        # while True:
+        #     time.sleep(1)
+        #     while not mux_info_queue.empty():
+        #         print(mux_info_queue.get())
 
     except KeyboardInterrupt:
         kill_cmd = (
             f'pgrep -f \"ffmpeg.*{args.in_path}.*{args.out_path}\" | xargs kill -9'
         )
-        for node in node_list:
-            node.kill()
-            node.join()
+        for process in mp.active_children():
+            process.join()
+            process.close()
 
-            execute_cmd_ssh(cmd=kill_cmd, hostname=node.hostname, username=node.ssh_username, get_pty=True)
+        for node in node_list:
+            execute_cmd_ssh(cmd=kill_cmd, hostname=node.hostname, ssh_username=node.ssh_username, get_pty=True)
+
         sys.exit()
 
 
