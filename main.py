@@ -177,6 +177,8 @@ class MuxWorker(mp.Process):
                                           f'\"{self.mux_video_path}/audio_{track_id}_{track_lang}_{track_name}_'
                                           f'{self.filename}\" -y')
 
+                            print(ffmpeg_cmd)
+
                             return_code, stderr = execute_cmd_ssh(cmd=ffmpeg_cmd, hostname="localhost",
                                                                   ssh_username=self.ssh_username,
                                                                   stdout_queue=self.mux_info_queue,
@@ -774,9 +776,7 @@ class EncodeJob:
 
         if self.segments_completed.value == self.num_segments.value:
             # no longer needs to be shared, so ignore!
-            self.completed_segment_filename_list = sorted(self.completed_segment_filename_list,  # type: ignore
-                                                          key=lambda x: float(match.group(1)) if
-                                                          (match := re.search(r'/(\d+\.\d+)-', x)) else 0.0)
+            self.completed_segment_filename_list = sorted(self.completed_segment_filename_list)  # type: ignore
 
             MuxWorker(self.preset, self.out_path, self.filename, cast(list[str], self.completed_segment_filename_list),
                       self.additional_content, self.file_index, self.mux_info_queue, current_user, self)
