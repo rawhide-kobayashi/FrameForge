@@ -517,15 +517,15 @@ class RichHelper:
         return mux_text
 
     def create_node_table(self) -> Table:
-        for node in self.node_list:
-            if node.stats['cumulative_values']['Frames'].value > self.node_last_frames_value[node]:
-                frame_diff = node.stats['cumulative_values']['Frames'].value - self.node_last_frames_value[node]
-                self.cumulative_frames += frame_diff
-                self.node_last_frames_value[node] = node.stats['cumulative_values']['Frames'].value
-                self.global_progress.update(self.global_progress_bar, advance=frame_diff,
-                                            total=self.global_frames.value)
+        # for node in self.node_list:
+        #     if node.stats['cumulative_values']['Frames'].value > self.node_last_frames_value[node]:
+        #         frame_diff = node.stats['cumulative_values']['Frames'].value - self.node_last_frames_value[node]
+        #         self.cumulative_frames += frame_diff
+        #         self.node_last_frames_value[node] = node.stats['cumulative_values']['Frames'].value
+        #         self.global_progress.update(self.global_progress_bar, advance=frame_diff,
+        #                                     total=self.global_frames.value)
 
-        table = Table(title=cast(str, self.global_progress))
+        table = Table()
         table.add_column(header="Hostname", min_width=16)
         table.add_column(header="# Frames", min_width=8)
         table.add_column(header="Avg FPS", min_width=7)
@@ -536,24 +536,32 @@ class RichHelper:
                           str(node.stats['avg_values']['FPS'].value), f"{node.stats['avg_values']['%RT'].value}x")
         return table
 
+    def update_header(self) -> Progress:
+        for node in self.node_list:
+            if node.stats['cumulative_values']['Frames'].value > self.node_last_frames_value[node]:
+                frame_diff = node.stats['cumulative_values']['Frames'].value - self.node_last_frames_value[node]
+                self.cumulative_frames += frame_diff
+                self.node_last_frames_value[node] = node.stats['cumulative_values']['Frames'].value
+                self.global_progress.update(self.global_progress_bar, advance=frame_diff,
+                                            total=self.global_frames.value)
+
+        return self.global_progress
+
+
     def create_segment_progress_table(self, segment_progress_update_queue: mp.Queue[tuple[VideoSegment, str, int, str]],
                                       segment_progress_bar_dict: dict[VideoSegment, dict[str, Any]]
                                       ) -> Table:
 
         table = Table.grid(expand=True)
-        table.add_column()
-        table.add_column()
-        table.add_column()
-        table.add_column()
 
         while not segment_progress_update_queue.empty():
             segment, command, frame_input, color = segment_progress_update_queue.get()
             if command == 'create':
                 segment_progress_bar_dict.update({
                     segment: {
-                        'bar_obj': Progress(SpinnerColumn(), TextColumn("{task.description}"),
-                                            TimeRemainingColumn(), MofNCompleteColumn(), TransferSpeedColumnFPS()),
-                        'bar_marquee': TextMarquee(segment.marquee_string, 8),
+                        'bar_obj': Progress(SpinnerColumn(), *Progress.get_default_columns(),
+                                            MofNCompleteColumn(), TransferSpeedColumnFPS()),
+                        'bar_marquee': TextMarquee(segment.marquee_string, 14),
                         'bar_color': color
                     }
                 })
@@ -576,18 +584,9 @@ class RichHelper:
                     description=f'[{segment_progress_bar_dict[segment]['bar_color']}]'
                                 f'{segment_progress_bar_dict[segment]['bar_marquee'].advance()}', advance=frame_input)
 
-        temp_column_list = []
-
         for segment in self.segment_list.keys():
             if self.segment_list[segment]['assigned']:
-                # table.add_row(segment_progress_bar_dict[segment]['bar_obj'])
-                temp_column_list.append(segment_progress_bar_dict[segment]['bar_obj'])
-                if len(temp_column_list) == 3:
-                    table.add_row(*temp_column_list)
-                    temp_column_list = []
-
-        if len(temp_column_list) > 0:
-            table.add_row(*temp_column_list)
+                table.add_row(segment_progress_bar_dict[segment]['bar_obj'])
 
         return table
 
@@ -601,8 +600,7 @@ class VideoSegment:
         self.file_output_fstring = (f'{self.encode_job.out_path}/temp/{self.encode_job.preset['name']}/'
                                     f'{self.encode_job.filename}/{self.source_filename}')
 
-        self.marquee_string: str = (f'   <-- {self.encode_job.preset['name']} - {self.encode_job.filename} - '
-                                    f'{self.source_fullpath} -->   ')
+        self.marquee_string: str = f' <-- {self.encode_job.preset['name']} - {self.encode_job.filename} --> '
 
         self.duration = get_duration(self.source_fullpath)
         self.num_frames: int = round(self.duration * self.encode_job.framerate)
@@ -1079,9 +1077,11 @@ def main() -> None:
     tui = RichHelper(node_list, segment_list, mux_info_queue, global_frames)
     layout = Layout()
     # layout.split_column(Layout(name="header", size=4), Layout(name="table"), Layout(name="footer", size=8))
-    layout.split_column(Layout(name="table"), Layout(name="segment_tracker"), Layout(name="stderr", size=10),
-                        Layout(name="Mux Info", size=10))
-    layout['table'].update(tui.create_node_table())
+    layout.split_column(Layout(name="header", size=1), Layout(name="main"), Layout(name="stderr"),
+                        Layout(name="Mux Info"))
+    layout['header'].update(tui.update_header())
+    layout['main'].split_row(Layout(name="node_table"), Layout(name="segment_tracker"))
+    layout['node_table'].update(tui.create_node_table())
     layout['segment_tracker'].update(tui.create_segment_progress_table(segment_progress_update_queue,
                                                                        segment_progress_bar_dict))
     layout['stderr'].update(Panel("Nothing here yet!", title="Errors"))
@@ -1090,7 +1090,8 @@ def main() -> None:
     try:
         with Live(layout, refresh_per_second=1, screen=True):
             while True:
-                layout['table'].update(tui.create_node_table())
+                layout['header'].update(tui.update_header())
+                layout['node_table'].update(tui.create_node_table())
                 segment_list_lock.acquire()
                 layout['segment_tracker'].update(tui.create_segment_progress_table(segment_progress_update_queue,
                                                                                    segment_progress_bar_dict))
@@ -1111,8 +1112,8 @@ def main() -> None:
             f'pgrep -f \"ffmpeg.*{args.in_path}.*{args.out_path}\" | xargs kill -9'
         )
         for process in mp.active_children():
+            process.kill()
             process.join()
-            process.close()
 
         for node in node_list:
             execute_cmd_ssh(cmd=kill_cmd, hostname=node.hostname, ssh_username=node.ssh_username, get_pty=True)
