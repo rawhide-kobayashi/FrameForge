@@ -11,7 +11,6 @@ import multiprocessing as mp
 import multiprocessing.managers
 import time
 import re
-import math
 import select
 from rich.live import Live  # type: ignore
 from rich.table import Table  # type: ignore
@@ -19,7 +18,7 @@ from rich.layout import Layout  # type: ignore
 from rich.panel import Panel  # type: ignore
 from rich import print  # type: ignore
 from rich.progress import Progress, ProgressColumn, SpinnerColumn, TextColumn, MofNCompleteColumn  # type: ignore
-from rich.progress import TimeRemainingColumn, Text, Task
+from rich.progress import Text, Task
 import paramiko
 from datetime import datetime
 from typing import Any, cast
@@ -547,7 +546,6 @@ class RichHelper:
 
         return self.global_progress
 
-
     def create_segment_progress_table(self, segment_progress_update_queue: mp.Queue[tuple[VideoSegment, str, int, str]],
                                       segment_progress_bar_dict: dict[VideoSegment, dict[str, Any]]
                                       ) -> Table:
@@ -715,7 +713,8 @@ class EncodeJob:
     def __init__(self, input_file: str, preset: dict[str, str], out_path: str, filename: str,
                  additional_content: dict[str, Any], file_index: int, mux_info_queue: mp.Queue[str],
                  segment_tally_counter: mp.managers.ValueProxy[int],
-                 completed_segment_filename_list: mp.managers.ListProxy[str], ssh_username: str) -> None:
+                 completed_segment_filename_list: mp.managers.ListProxy[str], ssh_username: str,
+                 num_segments: mp.managers.ValueProxy[int]) -> None:
         self.input_file = input_file
         self.job_name = f'{preset['name']}_{filename}'
         self.framerate_numerator, self.framerate_denominator = get_framerate(self.input_file)
@@ -731,7 +730,7 @@ class EncodeJob:
         self.temp_segment_dir = f'{self.out_path}/temp/source_segments/{self.filename}/'
         self.segment_txt = f'{self.temp_segment_dir}list.txt'
         self.ssh_username = ssh_username
-        self.num_segments = 0
+        self.num_segments = num_segments
         self.duration = get_duration(self.input_file)
         self.frames_total = round(self.duration * self.framerate)
 
@@ -773,7 +772,7 @@ class EncodeJob:
         self.segments_completed.value += 1
         self.completed_segment_filename_list.append(filename)
 
-        if self.segments_completed.value == self.num_segments:
+        if self.segments_completed.value == self.num_segments.value:
             # no longer needs to be shared, so ignore!
             self.completed_segment_filename_list = sorted(self.completed_segment_filename_list,  # type: ignore
                                                           key=lambda x: float(match.group(1)) if
@@ -815,7 +814,7 @@ class EncodeJob:
                             self.add_segment(source_fullpath=last_line, segment_list=segment_list,
                                              segment_list_lock=segment_list_lock, global_frames=global_frames)
                             last_line = line
-                            self.num_segments += 1
+                            self.num_segments.value += 1
 
                         else:
                             last_line = line
@@ -825,7 +824,7 @@ class EncodeJob:
 
         else:
             lines = lines[:-1]
-            self.num_segments = len(lines)
+            self.num_segments.value = len(lines)
 
             for line in lines:
                 line = line.strip()
@@ -976,7 +975,8 @@ class JobExecutor(mp.Process):
                  segment_list_lock: TypedLock, in_path: str, out_path: str, ssh_username: str,
                  segment_tally_list: mp.managers.ListProxy[mp.managers.ValueProxy[int]],
                  manager: multiprocessing.managers.SyncManager, config: dict[str, Any],
-                 mux_info_queue: mp.Queue[str], global_frames: multiprocessing.managers.ValueProxy[int]) -> None:
+                 mux_info_queue: mp.Queue[str], global_frames: multiprocessing.managers.ValueProxy[int],
+                 segment_job_total_list: mp.managers.ListProxy[mp.managers.ValueProxy[int]]) -> None:
         super().__init__()
         self.job_list = job_list
         self.job_list_lock = job_list_lock
@@ -990,6 +990,7 @@ class JobExecutor(mp.Process):
         self.config = config
         self.mux_info_queue = mux_info_queue
         self.global_frames = global_frames
+        self.segment_job_total_list = segment_job_total_list
         self.start()
 
     def run(self) -> None:
@@ -999,12 +1000,13 @@ class JobExecutor(mp.Process):
             file_fullpath = os.path.join(self.in_path, file)
             for preset in self.config['presets']:
                 self.segment_tally_list.append(self.manager.Value('i', 0))
+                self.segment_job_total_list.append(self.manager.Value('i', 0))
                 completed_segment_filename_list.append(self.manager.list())
                 job = EncodeJob(input_file=file_fullpath, preset=preset, out_path=self.out_path, filename=file,
                                 additional_content=self.config['additional_content'], file_index=x,
                                 mux_info_queue=self.mux_info_queue, segment_tally_counter=self.segment_tally_list[-1],
                                 completed_segment_filename_list=completed_segment_filename_list[-1],
-                                ssh_username=self.ssh_username)
+                                ssh_username=self.ssh_username, num_segments=self.segment_job_total_list[-1])
 
                 if not job.check_if_exists():
                     self.job_list.append(job)
@@ -1051,6 +1053,7 @@ def main() -> None:
 
     # shared list that contains shareable values for counting segments that are finished encoding
     segment_tally_list = manager.list()
+    segment_job_total_list = manager.list()
 
     segment_progress_update_queue: mp.Queue[tuple[VideoSegment, str, int, Any]] = manager.Queue()  # type: ignore
     segment_progress_bar_dict: dict[VideoSegment, dict[str, Any]] = {}
@@ -1058,7 +1061,8 @@ def main() -> None:
     job_executor = JobExecutor(job_list=job_list, job_list_lock=job_list_lock, segment_list=segment_list,
                                segment_list_lock=segment_list_lock, in_path=args.in_path, out_path=args.out_path,
                                ssh_username=ssh_username, segment_tally_list=segment_tally_list, manager=manager,
-                               config=config, mux_info_queue=mux_info_queue, global_frames=global_frames)
+                               config=config, mux_info_queue=mux_info_queue, global_frames=global_frames,
+                               segment_job_total_list=segment_job_total_list)
 
     node_list = []
 
