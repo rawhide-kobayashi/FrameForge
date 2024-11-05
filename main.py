@@ -146,12 +146,6 @@ class MuxWorker(mp.Process):
         mux_subtitles_only = "-A -D -B -T --no-chapters --no-attachments --no-global-tags"
         mux_chapters_only = "-A -D -S -B -T --no-attachments --no-global-tags"
 
-        # mkvmerge_mux_string = (f'mkvmerge -v --title "{os.path.splitext(self.filename)[0]}" -o "{self.out_path}/'
-        #                        f'{self.preset['name']}/{self.filename}" {mux_video_only} --default-duration 0:'
-        #                        f'{self.encode_job.framerate_numerator}/{self.encode_job.framerate_denominator}fps '
-        #                        f'--video-tracks 0 \"{self.out_path}/{self.preset['name']}/temp/{self.filename}/'
-        #                        f'{self.filename}\" ')
-
         mkvmerge_mux_string = (f'mkvmerge -v --title "{os.path.splitext(self.filename)[0]}" -o "{self.out_path}/'
                                f'output/{self.preset['name']}/{self.filename}" {mux_video_only} '
                                f'--video-tracks 0 \"{self.mux_video_path}/{self.filename}\" ')
@@ -176,8 +170,6 @@ class MuxWorker(mp.Process):
                                           f'-map_chapters -{track_id} {self.preset['ffmpeg_audio_params']} '
                                           f'\"{self.mux_video_path}/audio_{track_id}_{track_lang}_{track_name}_'
                                           f'{self.filename}\" -y')
-
-                            print(ffmpeg_cmd)
 
                             return_code, stderr = execute_cmd_ssh(cmd=ffmpeg_cmd, hostname="localhost",
                                                                   ssh_username=self.ssh_username,
@@ -354,11 +346,9 @@ class NodeManager(mp.Process):
                     results = worker.results_queue.get()
                     self.segment_list_lock.acquire()
                     if results[1][0] == 0:
-                        if worker.segment.check_if_exists(current_user=self.ssh_username):
-                            self.segment_list.pop(worker.segment)
-
-                        else:
-                            self.segment_list[worker.segment] = {'assigned': False}
+                        with open(worker.segment.encode_job.segment_output_txt, 'a') as file:
+                            file.write(worker.segment.file_output_fstring)
+                        self.segment_list.pop(worker.segment)
 
                     else:
                         self.segment_list[worker.segment] = {'assigned': False}
@@ -410,7 +400,7 @@ class NodeManager(mp.Process):
                                     break
 
                     self.segment_list_lock.release()
-            time.sleep(0.1)
+            time.sleep(1)
 
 
 class NodeWorker(mp.Process):
@@ -612,32 +602,46 @@ class VideoSegment:
     def __eq__(self, other: object) -> bool:
         return isinstance(other, VideoSegment) and self.file_output_fstring == other.file_output_fstring
 
-    def check_if_exists(self, current_user: str) -> bool:
-        cmd = [
-            'ffprobe', '-v', 'error', '-select_streams', 'v',
-            '-of', 'default=noprint_wrappers=1:nokey=1',
-            '-show_entries', 'format=duration', self.file_output_fstring
-        ]
-        if os.path.isfile(self.file_output_fstring):
-            duration_proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if duration_proc.returncode == 0:
-                duration = round(float(duration_proc.stdout.strip()), 3)
-                frame_diff = seconds_to_frames(duration, self.encode_job.framerate) - self.num_frames
+    # def check_if_exists(self, current_user: str) -> bool:
+    #     # fuck this entire shit
+    #     cmd = [
+    #         'ffprobe', '-v', 'error', '-select_streams', 'v',
+    #         '-of', 'default=noprint_wrappers=1:nokey=1',
+    #         '-show_entries', 'format=duration', self.file_output_fstring
+    #     ]
+    #     if os.path.isfile(self.file_output_fstring):
+    #         duration_proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    #         if duration_proc.returncode == 0:
+    #             duration = round(float(duration_proc.stdout.strip()), 3)
+    #             frame_diff = seconds_to_frames(duration, self.encode_job.framerate) - self.num_frames
+    #
+    #             # fudge factor for fuckin bullshit ffmpeg timestamps
+    #             if -3 <= frame_diff <= 3:
+    #                 self.encode_job.tally_completed_segments(self.file_output_fstring, current_user)
+    #                 return True
+    #             else:
+    #                 # print(f"Duration not equal: Expected {self.num_frames}, got "
+    #                 #       f"{seconds_to_frames(duration, self.encode_job.framerate)}")
+    #                 # print(f"{self.encode_job.framerate}")
+    #                 # print(f"File: {self.file_output_fstring}")
+    #                 os.remove(self.file_output_fstring)
+    #                 return False
+    #         else:
+    #             # print(f"Malformed file: {self.file_output_fstring}")
+    #             os.remove(self.file_output_fstring)
+    #             return False
+    #     else:
+    #         return False
 
-                # fudge factor for fuckin bullshit ffmpeg timestamps
-                if -3 <= frame_diff <= 3:
-                    self.encode_job.tally_completed_segments(self.file_output_fstring, current_user)
-                    return True
-                else:
-                    # print(f"Duration not equal: Expected {self.num_frames}, got "
-                    #       f"{seconds_to_frames(duration, self.encode_job.framerate)}")
-                    # print(f"{self.encode_job.framerate}")
-                    # print(f"File: {self.file_output_fstring}")
-                    os.remove(self.file_output_fstring)
-                    return False
-            else:
-                # print(f"Malformed file: {self.file_output_fstring}")
-                os.remove(self.file_output_fstring)
+    def check_if_exists(self) -> bool:
+        if os.path.isfile(self.file_output_fstring):
+            with open(self.encode_job.segment_output_txt, 'r') as file:
+                lines = file.readlines()
+
+                for line in lines:
+                    if line == self.file_output_fstring:
+                        return True
+
                 return False
         else:
             return False
@@ -730,7 +734,8 @@ class EncodeJob:
         self.mux_info_queue = mux_info_queue
         self.file_index = file_index
         self.temp_segment_dir = f'{self.out_path}/temp/source_segments/{self.filename}/'
-        self.segment_txt = f'{self.temp_segment_dir}list.txt'
+        self.segment_input_txt = f'{self.temp_segment_dir}list.txt'
+        self.segment_output_txt = f'{self.out_path}/temp/{self.preset['name']}/{self.filename}/segments.txt'
         self.ssh_username = ssh_username
         self.num_segments = num_segments
         self.duration = get_duration(self.input_file)
@@ -785,15 +790,15 @@ class EncodeJob:
                                    segment_list_lock: TypedLock,
                                    global_frames: multiprocessing.managers.ValueProxy[int]) -> None:
         last_line = ""
-        if os.path.exists(f'{self.segment_txt}'):
-            with open(self.segment_txt, 'r') as file:
+        if os.path.exists(f'{self.segment_input_txt}'):
+            with open(self.segment_input_txt, 'r') as file:
                 lines = file.readlines()
                 if lines:
                     last_line = lines[-1].strip()
 
         if last_line != 'completed':
             segment_cmd = (f'ffmpeg -i \"{self.input_file}\" -map 0 -c copy -f segment -reset_timestamps 1 '
-                           f'-segment_list_type flat -segment_time 30 -segment_list \"{self.segment_txt}\" '
+                           f'-segment_list_type flat -segment_time 30 -segment_list \"{self.segment_input_txt}\" '
                            f'\"{self.temp_segment_dir}%05d_{self.filename}\"')
 
             # the ssh stdout struggles will continue until morale improves
@@ -819,7 +824,7 @@ class EncodeJob:
                         else:
                             last_line = line
 
-            with open(self.segment_txt, 'a') as file:
+            with open(self.segment_input_txt, 'a') as file:
                 file.write('completed')
 
         else:
@@ -834,7 +839,7 @@ class EncodeJob:
     def add_segment(self, source_fullpath: str, segment_list: mp.managers.DictProxy[VideoSegment, dict[str, bool]],
                     segment_list_lock: TypedLock, global_frames: multiprocessing.managers.ValueProxy[int]) -> None:
         segment = VideoSegment(encode_job=self, source_fullpath=source_fullpath)
-        if not segment.check_if_exists(current_user=self.ssh_username):
+        if not segment.check_if_exists():
             segment_list_lock.acquire()
             segment_list.update({
                 segment: {
