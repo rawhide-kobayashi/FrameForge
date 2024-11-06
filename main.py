@@ -825,6 +825,8 @@ class EncodeJob:
     def tally_completed_segments(self, filename: str, current_user: str) -> None:
         self.segments_completed.value += 1
         self.completed_segment_filename_list.append(filename)
+        print(self.segments_completed.value)
+        print(self.num_segments.value)
 
         if self.segments_completed.value == self.num_segments.value:
             # no longer needs to be shared, so ignore!
@@ -871,6 +873,11 @@ class EncodeJob:
 
                         else:
                             last_line = line
+
+                    elif 'muxing overhead' in stdout:
+                        self.add_segment(source_fullpath=last_line, segment_list=segment_list,
+                                         segment_list_lock=segment_list_lock, global_frames=global_frames)
+                        self.num_segments.value += 1
 
             with open(self.segment_input_txt, 'a') as file:
                 file.write('completed')
