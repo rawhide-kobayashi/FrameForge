@@ -350,6 +350,10 @@ class NodeManager(mp.Process):
                     if results[1][0] == 0:
                         with open(worker.segment.encode_job.segment_output_txt, 'a') as file:
                             file.write(f'{worker.segment.file_output_fstring}\n')
+                        self.segment_progress_update_queue.put((worker.segment, 'delete', 0, self.color))
+                        print("calling tally")
+                        worker.segment.encode_job.tally_completed_segments(worker.segment.file_output_fstring,
+                                                                           self.ssh_username)
                         self.segment_list.pop(worker.segment)
 
                     else:
@@ -612,6 +616,9 @@ class RichHelper:
                                 f'{self.segment_progress_bar_dict[segment]['bar_marquee'].advance()}',
                     advance=frame_input)
 
+            elif command == 'delete':
+                self.segment_progress_bar_dict.pop(segment)
+
         segment_not_assigned_counter = 0
         for segment in self.segment_list.keys():
             if self.segment_list[segment]['assigned']:
@@ -661,16 +668,21 @@ class VideoSegment:
     def __eq__(self, other: object) -> bool:
         return isinstance(other, VideoSegment) and self.file_output_fstring == other.file_output_fstring
 
-    def check_if_exists(self) -> bool:
+    def check_if_exists(self, ssh_username: str) -> bool:
         if os.path.isfile(self.file_output_fstring):
-            with open(self.encode_job.segment_output_txt, 'r') as file:
-                lines = file.readlines()
+            if os.path.isfile(self.encode_job.segment_output_txt):
+                with open(self.encode_job.segment_output_txt, 'r') as file:
+                    lines = file.readlines()
 
-                for line in lines:
-                    if line.strip() == self.file_output_fstring:
-                        return True
+                    for line in lines:
+                        if line.strip() == self.file_output_fstring:
+                            self.encode_job.tally_completed_segments(self.file_output_fstring, ssh_username)
+                            return True
 
-                return False
+                    return False
+
+            return False
+
         else:
             return False
 
@@ -875,7 +887,7 @@ class EncodeJob:
     def add_segment(self, source_fullpath: str, segment_list: mp.managers.DictProxy[VideoSegment, dict[str, bool]],
                     segment_list_lock: TypedLock, global_frames: multiprocessing.managers.ValueProxy[int]) -> None:
         segment = VideoSegment(encode_job=self, source_fullpath=source_fullpath)
-        if not segment.check_if_exists():
+        if not segment.check_if_exists(self.ssh_username):
             segment_list_lock.acquire()
             segment_list.update({
                 segment: {
