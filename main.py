@@ -15,7 +15,7 @@ from rich.live import Live  # type: ignore
 from rich.table import Table  # type: ignore
 from rich.layout import Layout  # type: ignore
 from rich.panel import Panel  # type: ignore
-from rich import print
+from rich import print  # type: ignore
 from rich.progress import Progress, ProgressColumn, SpinnerColumn, TextColumn, MofNCompleteColumn  # type: ignore
 from rich.progress import Text, Task, TimeRemainingColumn
 import paramiko
@@ -351,7 +351,6 @@ class NodeManager(mp.Process):
                         with open(worker.segment.encode_job.segment_output_txt, 'a') as file:
                             file.write(f'{worker.segment.file_output_fstring}\n')
                         self.segment_progress_update_queue.put((worker.segment, 'delete', 0, self.color))
-                        print("calling tally")
                         worker.segment.encode_job.tally_completed_segments(worker.segment.file_output_fstring,
                                                                            self.ssh_username)
                         self.segment_list.pop(worker.segment)
@@ -487,42 +486,42 @@ class RichHelper:
         for node in self.node_list:
             self.node_last_frames_value[node] = node.stats['cumulative_values']['Frames'].value
 
-        self.mux_strings_list = [""] * 8
-        self.stderr_strings_list = [""] * 8
+        self.mux_strings_list = [""] * 2
+        self.stderr_strings_list = [""] * 2
 
         self.global_progress = Progress(SpinnerColumn(), *Progress.get_default_columns(), MofNCompleteColumn(),
                                         TransferSpeedColumnFPS())
         self.global_progress_bar = self.global_progress.add_task("Total Progress",
                                                                  total=self.global_frames.value)
 
-    def update_stderr(self, stderr_queue: mp.Queue[tuple[str, tuple[int, str | Exception]]]) -> str:
-        stderr_text = ""
+    def update_stderr(self, stderr_queue: mp.Queue[tuple[str, tuple[int, str | Exception]]], height: int) -> str:
         stderr = stderr_queue.get()
         self.stderr_strings_list.append(f"{datetime.now().strftime('%H:%M:%S')} {stderr[0]}: "
                                         f"{str(stderr[1][1]).splitlines()[-1]}")
         if len(self.stderr_strings_list) > 8:
             self.stderr_strings_list.pop(0)
-        for x in range(len(self.stderr_strings_list)):
-            stderr_text += self.stderr_strings_list[x]
-            stderr_text += "\n"
-        return stderr_text
 
-    def update_mux_info(self, mux_info_queue: mp.Queue[str]) -> str:
-        mux_text = ""
+        while len(self.stderr_strings_list) > height:
+            self.stderr_strings_list.pop(0)
+
+        return '\n'.join(self.stderr_strings_list)
+
+    def update_mux_info(self, mux_info_queue: mp.Queue[str], height: int) -> str:
         new_mux_string = mux_info_queue.get()
         new_mux_prefix = new_mux_string.split(':')[0]
-        if self.mux_strings_list[7].startswith(new_mux_prefix):
-            self.mux_strings_list[7] = new_mux_string
+
+        if self.mux_strings_list[-1].startswith(new_mux_prefix):
+            self.mux_strings_list[-1] = new_mux_string
+
         else:
             self.mux_strings_list.append(new_mux_string)
-        if len(self.mux_strings_list) > 8:
-            self.mux_strings_list.pop(0)
-        for x in range(len(self.mux_strings_list)):
-            mux_text += self.mux_strings_list[x]
-            mux_text += "\n"
-        return mux_text
 
-    def create_node_table(self) -> Table:
+        while len(self.mux_strings_list) > height:
+            self.mux_strings_list.pop(0)
+
+        return '\n'.join(self.mux_strings_list)
+
+    def create_node_table(self) -> Panel:
         table = Table()
         table.add_column(header="Hostname", min_width=16)
         table.add_column(header="# Frames", min_width=8)
@@ -545,7 +544,7 @@ class RichHelper:
 
         return self.global_progress
 
-    def create_job_progress_table(self) -> Table:
+    def create_job_progress_table(self) -> Panel:
         table = Table.grid(expand=True)
 
         while not self.job_progress_update_queue.empty():
@@ -582,7 +581,7 @@ class RichHelper:
 
         return Panel(table)
 
-    def create_segment_progress_table(self) -> Table:
+    def create_segment_progress_table(self) -> Panel:
         table = Table.grid(expand=True)
 
         while not self.segment_progress_update_queue.empty():
@@ -625,7 +624,7 @@ class RichHelper:
                 table.add_row(self.segment_progress_bar_dict[segment]['bar_obj'])
 
             # skip unnecessary list traversal, but with a little wiggle for reassigned segment weirdness
-            elif segment_not_assigned_counter < 5:
+            elif segment_not_assigned_counter > 3:
                 break
 
             else:
@@ -1151,13 +1150,16 @@ def main() -> None:
                 segment_list_lock.acquire()
                 layout['segment_tracker'].update(tui.create_segment_progress_table())
                 segment_list_lock.release()
-                info_height = round((live.console.height - max(len(node_list) + 10, len(segment_progress_bar_dict) + 3)) / 2)
+                info_height = round((live.console.height - max(len(node_list) + 11,
+                                                               len(segment_progress_bar_dict) + 3)) / 2)
                 layout['Mux Info'].size = info_height
                 layout['stderr'].size = info_height
                 while not mux_info_queue.empty():
-                    layout['Mux Info'].update(Panel(tui.update_mux_info(mux_info_queue), title="Mux Info"))
+                    layout['Mux Info'].update(Panel(tui.update_mux_info(mux_info_queue, info_height - 2),
+                                                    title="Mux Info"))
                 while not (stderr_queue.empty()):
-                    layout['stderr'].update(Panel(tui.update_stderr(stderr_queue), title="stderr"))
+                    layout['stderr'].update(Panel(tui.update_stderr(stderr_queue, info_height - 2), title="stderr"))
+
                 time.sleep(1)
 
     except KeyboardInterrupt:
