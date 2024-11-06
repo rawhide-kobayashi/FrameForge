@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import random
-
 import yaml
 import argparse
 import os
@@ -16,9 +15,9 @@ from rich.live import Live  # type: ignore
 from rich.table import Table  # type: ignore
 from rich.layout import Layout  # type: ignore
 from rich.panel import Panel  # type: ignore
-from rich import print  # type: ignore
+from rich import print
 from rich.progress import Progress, ProgressColumn, SpinnerColumn, TextColumn, MofNCompleteColumn  # type: ignore
-from rich.progress import Text, Task
+from rich.progress import Text, Task, TimeRemainingColumn
 import paramiko
 from datetime import datetime
 from typing import Any, cast
@@ -230,9 +229,11 @@ class MuxWorker(mp.Process):
                     stderr = process.stderr.read()
                 time.sleep(0.01)
 
-        if not process.returncode == 0 and not self.encode_job.check_if_exists():
+        if not process.returncode == 0:
             self.mux_info_queue.put(f"Bad mux! {stderr}")
-            self.close()
+
+        elif not self.encode_job.check_if_exists():
+            self.mux_info_queue.put(f"Bad mux! Incorrect output file length!")
 
         else:
             self.mux_info_queue.put(f"Good mux: {self.preset['name']}/{self.filename}")
@@ -246,7 +247,8 @@ class NodeManager(mp.Process):
                  job_list: mp.managers.ListProxy[EncodeJob], job_list_lock: TypedLock,
                  segment_list: mp.managers.DictProxy[VideoSegment, dict[str, bool]],
                  segment_list_lock: TypedLock, stderr_queue: mp.Queue[tuple[str, tuple[int, str | Exception]]],
-                 color: str, segment_progress_update_queue: mp.Queue[tuple[VideoSegment, str, int, Any]]) -> None:
+                 color: str, segment_progress_update_queue: mp.Queue[tuple[VideoSegment, str, int, Any]],
+                 job_progress_update_queue: mp.Queue[tuple[EncodeJob, str, int]]) -> None:
         super().__init__()
         self.hostname = hostname
         self.ssh_username = ssh_username
@@ -261,6 +263,7 @@ class NodeManager(mp.Process):
         self.init_timestamp = time.time()
         self.color = color
         self.segment_progress_update_queue = segment_progress_update_queue
+        self.job_progress_update_queue = job_progress_update_queue
 
         self.stats: dict[str, dict[str, Any]] = {
             'cumulative_values': {
@@ -325,11 +328,10 @@ class NodeManager(mp.Process):
                         delta_time_total = current_time - self.init_timestamp
 
                         if not worker.stats['cur_values']['Frames'] == worker.stats['last_values']['Frames']:
-                            self.stats['cumulative_values']['Frames'].value += (worker.stats['cur_values']['Frames'] -
-                                                                                worker.stats['last_values']['Frames'])
-                            self.segment_progress_update_queue.put((worker.segment, 'update',
-                                                                    worker.stats['cur_values']['Frames'] -
-                                                                    worker.stats['last_values']['Frames'], self.color))
+                            frame_diff = worker.stats['cur_values']['Frames'] - worker.stats['last_values']['Frames']
+                            self.stats['cumulative_values']['Frames'].value += frame_diff
+                            self.segment_progress_update_queue.put((worker.segment, 'update', frame_diff, self.color))
+                            self.job_progress_update_queue.put((worker.segment.encode_job, 'update', frame_diff))
                             worker.stats['last_values']['Frames'] = worker.stats['cur_values']['Frames']
 
                         for metric in ['FPS', '%RT']:
@@ -347,7 +349,7 @@ class NodeManager(mp.Process):
                     self.segment_list_lock.acquire()
                     if results[1][0] == 0:
                         with open(worker.segment.encode_job.segment_output_txt, 'a') as file:
-                            file.write(worker.segment.file_output_fstring)
+                            file.write(f'{worker.segment.file_output_fstring}\n')
                         self.segment_list.pop(worker.segment)
 
                     else:
@@ -459,11 +461,20 @@ class NodeWorker(mp.Process):
 
 class RichHelper:
     def __init__(self, node_list: list[NodeManager], segment_list: mp.managers.DictProxy[VideoSegment, dict[str, bool]],
-                 mux_info_queue: mp.Queue[str], global_frames: multiprocessing.managers.ValueProxy[int]) -> None:
+                 mux_info_queue: mp.Queue[str], global_frames: multiprocessing.managers.ValueProxy[int],
+                 job_progress_bar_dict: dict[EncodeJob, dict[str, Any]],
+                 job_progress_update_queue: mp.Queue[tuple[EncodeJob, str, int]],
+                 segment_progress_update_queue: mp.Queue[tuple[VideoSegment, str, int, str]],
+                 segment_progress_bar_dict: dict[VideoSegment, dict[str, Any]], segment_list_lock: TypedLock) -> None:
         self.node_list = node_list
         self.segment_list = segment_list
         self.manager = mp.Manager()
         self.global_frames = global_frames
+        self.job_progress_bar_dict = job_progress_bar_dict
+        self.job_progress_update_queue = job_progress_update_queue
+        self.segment_progress_update_queue = segment_progress_update_queue
+        self.segment_progress_bar_dict = segment_progress_bar_dict
+        self.segment_list_lock = segment_list_lock
         self.cumulative_frames = 0
         self.init_time = time.time()
         self.mux_info_queue = mux_info_queue
@@ -508,14 +519,6 @@ class RichHelper:
         return mux_text
 
     def create_node_table(self) -> Table:
-        # for node in self.node_list:
-        #     if node.stats['cumulative_values']['Frames'].value > self.node_last_frames_value[node]:
-        #         frame_diff = node.stats['cumulative_values']['Frames'].value - self.node_last_frames_value[node]
-        #         self.cumulative_frames += frame_diff
-        #         self.node_last_frames_value[node] = node.stats['cumulative_values']['Frames'].value
-        #         self.global_progress.update(self.global_progress_bar, advance=frame_diff,
-        #                                     total=self.global_frames.value)
-
         table = Table()
         table.add_column(header="Hostname", min_width=16)
         table.add_column(header="# Frames", min_width=8)
@@ -525,7 +528,7 @@ class RichHelper:
             table.add_row(f'[{node.color}]{node.hostname}',
                           str(node.stats['cumulative_values']['Frames'].value),
                           str(node.stats['avg_values']['FPS'].value), f"{node.stats['avg_values']['%RT'].value}x")
-        return table
+        return Panel(table, height=len(self.node_list)+6)
 
     def update_header(self) -> Progress:
         for node in self.node_list:
@@ -538,47 +541,103 @@ class RichHelper:
 
         return self.global_progress
 
-    def create_segment_progress_table(self, segment_progress_update_queue: mp.Queue[tuple[VideoSegment, str, int, str]],
-                                      segment_progress_bar_dict: dict[VideoSegment, dict[str, Any]]
-                                      ) -> Table:
-
+    def create_job_progress_table(self) -> Table:
         table = Table.grid(expand=True)
 
-        while not segment_progress_update_queue.empty():
-            segment, command, frame_input, color = segment_progress_update_queue.get()
+        while not self.job_progress_update_queue.empty():
+            job, command, frame_input = self.job_progress_update_queue.get()
             if command == 'create':
-                segment_progress_bar_dict.update({
-                    segment: {
-                        'bar_obj': Progress(SpinnerColumn(), *Progress.get_default_columns(),
-                                            MofNCompleteColumn(), TransferSpeedColumnFPS()),
-                        'bar_marquee': TextMarquee(segment.marquee_string, 14),
-                        'bar_color': color
+                self.job_progress_bar_dict.update({
+                    job: {
+                        'bar_obj': Progress(SpinnerColumn(), TextColumn("{task.description}"),
+                                            TimeRemainingColumn(), MofNCompleteColumn(), TransferSpeedColumnFPS()),
+                        'bar_marquee': TextMarquee(f' <-- {job.job_name} --> ', 16)
                     }
                 })
 
-                segment_progress_bar_dict.update({
-                    segment: {
-                        'bar_obj': segment_progress_bar_dict[segment]['bar_obj'],
-                        'bar_id': segment_progress_bar_dict[segment]['bar_obj'].add_task(
-                            description=f'[{segment_progress_bar_dict[segment]['bar_color']}]'
-                                        f'{segment_progress_bar_dict[segment]['bar_marquee'].advance()}',
-                            total=segment.num_frames),
-                        'bar_marquee': segment_progress_bar_dict[segment]['bar_marquee'],
-                        'bar_color': segment_progress_bar_dict[segment]['bar_color']
+                self.job_progress_bar_dict.update({
+                    job: {
+                        'bar_obj': self.job_progress_bar_dict[job]['bar_obj'],
+                        'bar_id': self.job_progress_bar_dict[job]['bar_obj'].add_task(
+                            description=self.job_progress_bar_dict[job]['bar_marquee'].advance(),
+                            total=job.frames_total),
+                        'bar_marquee': self.job_progress_bar_dict[job]['bar_marquee']
                     }
                 })
 
             elif command == 'update':
-                segment_progress_bar_dict[segment]['bar_obj'].update(
-                    segment_progress_bar_dict[segment]['bar_id'],
-                    description=f'[{segment_progress_bar_dict[segment]['bar_color']}]'
-                                f'{segment_progress_bar_dict[segment]['bar_marquee'].advance()}', advance=frame_input)
+                self.job_progress_bar_dict[job]['bar_obj'].update(
+                    self.job_progress_bar_dict[job]['bar_id'],
+                    description=self.job_progress_bar_dict[job]['bar_marquee'].advance(), advance=frame_input)
 
+            elif command == 'delete':
+                self.job_progress_bar_dict.pop(job)
+
+        for job in self.job_progress_bar_dict.keys():
+            table.add_row(self.job_progress_bar_dict[job]['bar_obj'])
+
+        return Panel(table)
+
+    def create_segment_progress_table(self) -> Table:
+        table = Table.grid(expand=True)
+
+        while not self.segment_progress_update_queue.empty():
+            segment, command, frame_input, color = self.segment_progress_update_queue.get()
+            if command == 'create':
+                self.segment_progress_bar_dict.update({
+                    segment: {
+                        'bar_obj': Progress(SpinnerColumn(), *Progress.get_default_columns(),
+                                            MofNCompleteColumn(), TransferSpeedColumnFPS()),
+                        'bar_marquee': TextMarquee(segment.marquee_string, 12),
+                        'bar_color': color
+                    }
+                })
+
+                self.segment_progress_bar_dict.update({
+                    segment: {
+                        'bar_obj': self.segment_progress_bar_dict[segment]['bar_obj'],
+                        'bar_id': self.segment_progress_bar_dict[segment]['bar_obj'].add_task(
+                            description=f'[{self.segment_progress_bar_dict[segment]['bar_color']}]'
+                                        f'{self.segment_progress_bar_dict[segment]['bar_marquee'].advance()}',
+                            total=segment.num_frames),
+                        'bar_marquee': self.segment_progress_bar_dict[segment]['bar_marquee'],
+                        'bar_color': self.segment_progress_bar_dict[segment]['bar_color']
+                    }
+                })
+
+            elif command == 'update':
+                self.segment_progress_bar_dict[segment]['bar_obj'].update(
+                    self.segment_progress_bar_dict[segment]['bar_id'],
+                    description=f'[{self.segment_progress_bar_dict[segment]['bar_color']}]'
+                                f'{self.segment_progress_bar_dict[segment]['bar_marquee'].advance()}',
+                    advance=frame_input)
+
+        segment_not_assigned_counter = 0
         for segment in self.segment_list.keys():
             if self.segment_list[segment]['assigned']:
-                table.add_row(segment_progress_bar_dict[segment]['bar_obj'])
+                table.add_row(self.segment_progress_bar_dict[segment]['bar_obj'])
 
-        return table
+            # skip unnecessary list traversal, but with a little wiggle for reassigned segment weirdness
+            elif segment_not_assigned_counter < 5:
+                break
+
+            else:
+                segment_not_assigned_counter += 1
+
+        return Panel(table)
+
+    def create_layout(self) -> Layout:
+        layout = Layout()
+
+        layout.split_column(Layout(name="header", size=1), Layout(name="main"), Layout(name="stderr"),
+                            Layout(name="Mux Info"))
+        layout['main'].split_row(Layout(name="left_side", ratio=1), Layout(name="segment_tracker"))
+        layout['left_side'].split_column(Layout(name="node_table", size=len(self.node_list)+6),
+                                         Layout(name="job_tracker"))
+        layout['stderr'].update(Panel("Nothing here yet!", title="Errors"))
+        layout['Mux Info'].update(Panel("Nothing here yet...", title="Mux Info"))
+
+        return layout
 
 
 class VideoSegment:
@@ -602,44 +661,13 @@ class VideoSegment:
     def __eq__(self, other: object) -> bool:
         return isinstance(other, VideoSegment) and self.file_output_fstring == other.file_output_fstring
 
-    # def check_if_exists(self, current_user: str) -> bool:
-    #     # fuck this entire shit
-    #     cmd = [
-    #         'ffprobe', '-v', 'error', '-select_streams', 'v',
-    #         '-of', 'default=noprint_wrappers=1:nokey=1',
-    #         '-show_entries', 'format=duration', self.file_output_fstring
-    #     ]
-    #     if os.path.isfile(self.file_output_fstring):
-    #         duration_proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    #         if duration_proc.returncode == 0:
-    #             duration = round(float(duration_proc.stdout.strip()), 3)
-    #             frame_diff = seconds_to_frames(duration, self.encode_job.framerate) - self.num_frames
-    #
-    #             # fudge factor for fuckin bullshit ffmpeg timestamps
-    #             if -3 <= frame_diff <= 3:
-    #                 self.encode_job.tally_completed_segments(self.file_output_fstring, current_user)
-    #                 return True
-    #             else:
-    #                 # print(f"Duration not equal: Expected {self.num_frames}, got "
-    #                 #       f"{seconds_to_frames(duration, self.encode_job.framerate)}")
-    #                 # print(f"{self.encode_job.framerate}")
-    #                 # print(f"File: {self.file_output_fstring}")
-    #                 os.remove(self.file_output_fstring)
-    #                 return False
-    #         else:
-    #             # print(f"Malformed file: {self.file_output_fstring}")
-    #             os.remove(self.file_output_fstring)
-    #             return False
-    #     else:
-    #         return False
-
     def check_if_exists(self) -> bool:
         if os.path.isfile(self.file_output_fstring):
             with open(self.encode_job.segment_output_txt, 'r') as file:
                 lines = file.readlines()
 
                 for line in lines:
-                    if line == self.file_output_fstring:
+                    if line.strip() == self.file_output_fstring:
                         return True
 
                 return False
@@ -720,9 +748,10 @@ class EncodeJob:
                  additional_content: dict[str, Any], file_index: int, mux_info_queue: mp.Queue[str],
                  segment_tally_counter: mp.managers.ValueProxy[int],
                  completed_segment_filename_list: mp.managers.ListProxy[str], ssh_username: str,
-                 num_segments: mp.managers.ValueProxy[int]) -> None:
+                 num_segments: mp.managers.ValueProxy[int],
+                 job_progress_update_queue: mp.Queue[tuple[EncodeJob, str, int]]) -> None:
         self.input_file = input_file
-        self.job_name = f'{preset['name']}_{filename}'
+        self.job_name = f'{preset['name']} - {filename}'
         self.framerate_numerator, self.framerate_denominator = get_framerate(self.input_file)
         self.framerate = self.framerate_numerator / self.framerate_denominator
         self.preset = preset
@@ -737,6 +766,7 @@ class EncodeJob:
         self.segment_input_txt = f'{self.temp_segment_dir}list.txt'
         self.segment_output_txt = f'{self.out_path}/temp/{self.preset['name']}/{self.filename}/segments.txt'
         self.ssh_username = ssh_username
+        self.job_progress_update_queue = job_progress_update_queue
         self.num_segments = num_segments
         self.duration = get_duration(self.input_file)
         self.frames_total = round(self.duration * self.framerate)
@@ -749,6 +779,14 @@ class EncodeJob:
 
         if not os.path.isdir(f'{self.out_path}/output/{self.preset['name']}/'):
             os.makedirs(f'{self.out_path}/output/{self.preset['name']}/')
+
+        self.job_progress_update_queue.put((self, 'create', 0))
+
+    def __hash__(self) -> int:
+        return hash(self.segment_output_txt)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, EncodeJob) and self.segment_output_txt == other.segment_output_txt
 
     def check_if_exists(self) -> bool:
         cmd = [
@@ -765,8 +803,6 @@ class EncodeJob:
                     if seconds_to_frames(duration, self.framerate) == self.frames_total:
                         return True
                     else:
-                        # print(f'expected {self.frames_total}, got {seconds_to_frames(duration, self.framerate)}')
-                        # print(f'{duration}, {self.framerate}')
                         return False
                 else:
                     return False
@@ -785,6 +821,7 @@ class EncodeJob:
 
             MuxWorker(self.preset, self.out_path, self.filename, cast(list[str], self.completed_segment_filename_list),
                       self.additional_content, self.file_index, self.mux_info_queue, current_user, self)
+            self.job_progress_update_queue.put((self, 'delete', 0))
 
     def create_segment_encode_list(self, segment_list: mp.managers.DictProxy[VideoSegment, dict[str, bool]],
                                    segment_list_lock: TypedLock,
@@ -832,8 +869,7 @@ class EncodeJob:
             self.num_segments.value = len(lines)
 
             for line in lines:
-                line = line.strip()
-                self.add_segment(source_fullpath=f'{self.temp_segment_dir}{line}', segment_list=segment_list,
+                self.add_segment(source_fullpath=f'{self.temp_segment_dir}{line.strip()}', segment_list=segment_list,
                                  segment_list_lock=segment_list_lock, global_frames=global_frames)
 
     def add_segment(self, source_fullpath: str, segment_list: mp.managers.DictProxy[VideoSegment, dict[str, bool]],
@@ -849,6 +885,9 @@ class EncodeJob:
             segment_list_lock.release()
 
             global_frames.value += segment.num_frames
+
+        else:
+            self.job_progress_update_queue.put((self, 'update', segment.num_frames))
 
 
 def get_cpu_info(hostname: str, username: str,
@@ -868,8 +907,6 @@ def get_cpu_info(hostname: str, username: str,
                     avx512_stdout += stdout_queue.get()
 
             elif avx512_info[0] == -1:
-                # print(avx512_info[1])
-                # print(f"Failed to connect to {hostname}.")
                 return cast(Exception, avx512_info[1]), core_info_dict
 
             avx512_dict = json.loads(avx512_stdout)
@@ -881,7 +918,6 @@ def get_cpu_info(hostname: str, username: str,
     for child in avx512_dict['lscpu'][2]['children'][0]['children']:
         if child['field'] == 'Flags:':
             avx512 = True if 'avx512' in child['data'] else False
-            # print(f"AVX512 Capability Detected: {avx512}")
 
     while len(core_info_dict) == 0:
         try:
@@ -893,8 +929,6 @@ def get_cpu_info(hostname: str, username: str,
                     core_info_stdout += stdout_queue.get()
 
             elif core_info[0] == -1:
-                # print(core_info[1])
-                # print(f"Failed to connect to {hostname}.")
                 break
 
             core_info_dict = json.loads(core_info_stdout)
@@ -981,7 +1015,8 @@ class JobExecutor(mp.Process):
                  segment_tally_list: mp.managers.ListProxy[mp.managers.ValueProxy[int]],
                  manager: multiprocessing.managers.SyncManager, config: dict[str, Any],
                  mux_info_queue: mp.Queue[str], global_frames: multiprocessing.managers.ValueProxy[int],
-                 segment_job_total_list: mp.managers.ListProxy[mp.managers.ValueProxy[int]]) -> None:
+                 segment_job_total_list: mp.managers.ListProxy[mp.managers.ValueProxy[int]],
+                 job_progress_update_queue: mp.Queue[tuple[EncodeJob, str, int]]) -> None:
         super().__init__()
         self.job_list = job_list
         self.job_list_lock = job_list_lock
@@ -996,6 +1031,7 @@ class JobExecutor(mp.Process):
         self.mux_info_queue = mux_info_queue
         self.global_frames = global_frames
         self.segment_job_total_list = segment_job_total_list
+        self.job_progress_update_queue = job_progress_update_queue
         self.start()
 
     def run(self) -> None:
@@ -1011,7 +1047,8 @@ class JobExecutor(mp.Process):
                                 additional_content=self.config['additional_content'], file_index=x,
                                 mux_info_queue=self.mux_info_queue, segment_tally_counter=self.segment_tally_list[-1],
                                 completed_segment_filename_list=completed_segment_filename_list[-1],
-                                ssh_username=self.ssh_username, num_segments=self.segment_job_total_list[-1])
+                                ssh_username=self.ssh_username, num_segments=self.segment_job_total_list[-1],
+                                job_progress_update_queue=self.job_progress_update_queue)
 
                 if not job.check_if_exists():
                     self.job_list.append(job)
@@ -1063,11 +1100,15 @@ def main() -> None:
     segment_progress_update_queue: mp.Queue[tuple[VideoSegment, str, int, Any]] = manager.Queue()  # type: ignore
     segment_progress_bar_dict: dict[VideoSegment, dict[str, Any]] = {}
 
+    job_progress_update_queue: mp.Queue[tuple[EncodeJob, str, int]] = manager.Queue()  # type: ignore
+    job_progress_bar_dict: dict[EncodeJob, dict[str, Any]] = {}
+
     job_executor = JobExecutor(job_list=job_list, job_list_lock=job_list_lock, segment_list=segment_list,
                                segment_list_lock=segment_list_lock, in_path=args.in_path, out_path=args.out_path,
                                ssh_username=ssh_username, segment_tally_list=segment_tally_list, manager=manager,
                                config=config, mux_info_queue=mux_info_queue, global_frames=global_frames,
-                               segment_job_total_list=segment_job_total_list)
+                               segment_job_total_list=segment_job_total_list,
+                               job_progress_update_queue=job_progress_update_queue)
 
     node_list = []
 
@@ -1080,41 +1121,32 @@ def main() -> None:
         node_list += [NodeManager(hostname=worker_hostname, ssh_username=ssh_username,
                                   job_list=job_list, job_list_lock=job_list_lock, segment_list=segment_list,
                                   segment_list_lock=segment_list_lock, stderr_queue=stderr_queue, color=randcolor,
-                                  segment_progress_update_queue=segment_progress_update_queue)]
+                                  segment_progress_update_queue=segment_progress_update_queue,
+                                  job_progress_update_queue=job_progress_update_queue)]
         terminal_colors.remove(randcolor)
 
-    tui = RichHelper(node_list, segment_list, mux_info_queue, global_frames)
-    layout = Layout()
-    # layout.split_column(Layout(name="header", size=4), Layout(name="table"), Layout(name="footer", size=8))
-    layout.split_column(Layout(name="header", size=1), Layout(name="main"), Layout(name="stderr"),
-                        Layout(name="Mux Info"))
-    layout['header'].update(tui.update_header())
-    layout['main'].split_row(Layout(name="node_table"), Layout(name="segment_tracker"))
-    layout['node_table'].update(tui.create_node_table())
-    layout['segment_tracker'].update(tui.create_segment_progress_table(segment_progress_update_queue,
-                                                                       segment_progress_bar_dict))
-    layout['stderr'].update(Panel("Nothing here yet!", title="Errors"))
-    layout['Mux Info'].update(Panel("Nothing here yet...", title="Mux Info"))
+    tui = RichHelper(node_list, segment_list, mux_info_queue, global_frames, job_progress_bar_dict,
+                     job_progress_update_queue, segment_progress_update_queue, segment_progress_bar_dict,
+                     segment_list_lock)
+    layout = tui.create_layout()
 
     try:
-        with Live(layout, refresh_per_second=1, screen=True):
+        with Live(layout, refresh_per_second=1, screen=True) as live:
             while True:
                 layout['header'].update(tui.update_header())
                 layout['node_table'].update(tui.create_node_table())
+                layout['job_tracker'].update(tui.create_job_progress_table())
                 segment_list_lock.acquire()
-                layout['segment_tracker'].update(tui.create_segment_progress_table(segment_progress_update_queue,
-                                                                                   segment_progress_bar_dict))
+                layout['segment_tracker'].update(tui.create_segment_progress_table())
                 segment_list_lock.release()
+                info_height = round((live.console.height - max(len(node_list) + 10, len(segment_progress_bar_dict) + 3)) / 2)
+                layout['Mux Info'].size = info_height
+                layout['stderr'].size = info_height
                 while not mux_info_queue.empty():
                     layout['Mux Info'].update(Panel(tui.update_mux_info(mux_info_queue), title="Mux Info"))
                 while not (stderr_queue.empty()):
                     layout['stderr'].update(Panel(tui.update_stderr(stderr_queue), title="stderr"))
                 time.sleep(1)
-
-        # while True:
-        #     time.sleep(1)
-        #     while not mux_info_queue.empty():
-        #         print(mux_info_queue.get())
 
     except KeyboardInterrupt:
         kill_cmd = (
