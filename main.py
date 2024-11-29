@@ -356,6 +356,7 @@ class NodeManager(mp.Process):
                         self.segment_list.pop(worker.segment)
 
                     else:
+                        self.segment_progress_update_queue.put((worker.segment, 'delete', 0, self.color))
                         self.segment_list[worker.segment] = {'assigned': False}
                         self.stderr_queue.put(results)
 
@@ -687,8 +688,8 @@ class VideoSegment:
 
     def encode(self, hostname: str, ssh_username: str, stdout_queue: mp.Queue[str],
                pool_threads: int, avx512: bool, taskset_threads: str = "") -> tuple[int, str | Exception]:
-        cmd = (f'{taskset_threads} ffmpeg -i \"{self.source_fullpath}\" -c:v {self.encode_job.preset['video_encoder']} '
-               f'{self.encode_job.preset['ffmpeg_video_params']} ')
+        cmd = (f'{taskset_threads} ffmpeg -ss 0 -i \"{self.source_fullpath}\" -c:v {self.encode_job.preset['video_encoder']} '
+               f'{self.encode_job.preset['ffmpeg_video_params']} -reset_timestamps 1 -fflags +genpts ')
 
         if self.encode_job.preset['video_encoder'] == 'libx265':
             cmd += f'-x265-params \"{self.encode_job.preset['encoder_params']}'
@@ -791,8 +792,6 @@ class EncodeJob:
         if not os.path.isdir(f'{self.out_path}/output/{self.preset['name']}/'):
             os.makedirs(f'{self.out_path}/output/{self.preset['name']}/')
 
-        self.job_progress_update_queue.put((self, 'create', 0))
-
     def __hash__(self) -> int:
         return hash(self.segment_output_txt)
 
@@ -825,8 +824,6 @@ class EncodeJob:
     def tally_completed_segments(self, filename: str, current_user: str) -> None:
         self.segments_completed.value += 1
         self.completed_segment_filename_list.append(filename)
-        print(self.segments_completed.value)
-        print(self.num_segments.value)
 
         if self.segments_completed.value == self.num_segments.value:
             # no longer needs to be shared, so ignore!
@@ -1070,6 +1067,7 @@ class JobExecutor(mp.Process):
 
                 if not job.check_if_exists():
                     self.job_list.append(job)
+                    self.job_progress_update_queue.put((job, 'create', 0))
                     job.create_segment_encode_list(self.segment_list, self.segment_list_lock, self.global_frames)
 
                 time.sleep(5)
@@ -1171,7 +1169,7 @@ def main() -> None:
 
     except KeyboardInterrupt:
         kill_cmd = (
-            f'pgrep -f \"ffmpeg.*{args.in_path}.*{args.out_path}\" | xargs kill -9'
+            f'pgrep -f \"ffmpeg.*{args.out_path}\" | xargs kill -9'
         )
         for process in mp.active_children():
             process.kill()
