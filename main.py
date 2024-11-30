@@ -237,7 +237,7 @@ class MuxWorker(mp.Process):
 
         else:
             self.mux_info_queue.put(f"Good mux: {self.preset['name']}/{self.filename}")
-            shutil.rmtree(self.mux_video_path)
+            #shutil.rmtree(self.mux_video_path)
 
         self.close()
 
@@ -669,26 +669,50 @@ class VideoSegment:
         return isinstance(other, VideoSegment) and self.file_output_fstring == other.file_output_fstring
 
     def check_if_exists(self, ssh_username: str) -> bool:
+        #if os.path.isfile(self.file_output_fstring):
+        #    if os.path.isfile(self.encode_job.segment_output_txt):
+        #        with open(self.encode_job.segment_output_txt, 'r') as file:
+        #            lines = file.readlines()
+#
+        #            for line in lines:
+        #                if line.strip() == self.file_output_fstring:
+        #                    self.encode_job.tally_completed_segments(self.file_output_fstring, ssh_username)
+        #                    return True
+#
+        #            return False
+#
+        #    return False
+#
+        #else:
+        #    return False
+
+        cmd = [
+            'ffprobe', '-v', 'error', '-select_streams', 'v',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            '-show_entries', 'format=duration', self.file_output_fstring
+        ]
+
         if os.path.isfile(self.file_output_fstring):
-            if os.path.isfile(self.encode_job.segment_output_txt):
-                with open(self.encode_job.segment_output_txt, 'r') as file:
-                    lines = file.readlines()
-
-                    for line in lines:
-                        if line.strip() == self.file_output_fstring:
-                            self.encode_job.tally_completed_segments(self.file_output_fstring, ssh_username)
-                            return True
-
+            duration_proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if duration_proc.returncode == 0:
+                if not duration_proc.stdout.strip() == "N/A":
+                    duration = round(float(duration_proc.stdout.strip()), 3)
+                    if seconds_to_frames(duration, self.encode_job.framerate) == self.num_frames:
+                        return True
+                    else:
+                        print(f'{self.file_output_fstring} bad duration')
+                        print(f'should be {self.num_frames}, got {seconds_to_frames(duration, self.encode_job.framerate)}')
+                        return True
+                else:
                     return False
-
-            return False
-
+            else:
+                return False
         else:
             return False
 
     def encode(self, hostname: str, ssh_username: str, stdout_queue: mp.Queue[str],
                pool_threads: int, avx512: bool, taskset_threads: str = "") -> tuple[int, str | Exception]:
-        cmd = (f'{taskset_threads} ffmpeg -ss 0 -i \"{self.source_fullpath}\" -c:v {self.encode_job.preset['video_encoder']} '
+        cmd = (f'{taskset_threads} ffmpeg -ss 0 -i \"{self.source_fullpath}\" -vf setpts=PTS-STARTPTS -c:v {self.encode_job.preset['video_encoder']} '
                f'{self.encode_job.preset['ffmpeg_video_params']} -reset_timestamps 1 -fflags +genpts ')
 
         if self.encode_job.preset['video_encoder'] == 'libx265':
@@ -836,17 +860,29 @@ class EncodeJob:
     def create_segment_encode_list(self, segment_list: mp.managers.DictProxy[VideoSegment, dict[str, bool]],
                                    segment_list_lock: TypedLock,
                                    global_frames: multiprocessing.managers.ValueProxy[int]) -> None:
-        last_line = ""
+        last_filename = ""
         if os.path.exists(f'{self.segment_input_txt}'):
             with open(self.segment_input_txt, 'r') as file:
                 lines = file.readlines()
                 if lines:
                     last_line = lines[-1].strip()
 
+        else:
+            with open(f'{self.segment_input_txt}', 'x') as file:
+                last_line = ""
+
         if last_line != 'completed':
+            os.remove(f'{self.segment_input_txt}')
+
+            with open(f'{self.segment_input_txt}', 'x') as file:
+                pass
+
             segment_cmd = (f'ffmpeg -i \"{self.input_file}\" -map 0 -c copy -f segment -reset_timestamps 1 '
                            f'-segment_list_type flat -segment_time 30 -segment_list \"{self.segment_input_txt}\" '
                            f'\"{self.temp_segment_dir}%05d_{self.filename}\"')
+
+            segment_cmd = (f'mkvmerge --split duration:30s \"{self.input_file}\" -o '
+                           f'\"{self.temp_segment_dir}{self.filename}\"')
 
             # the ssh stdout struggles will continue until morale improves
             stdout_queue: mp.Queue[str] = mp.Queue()
@@ -855,26 +891,28 @@ class EncodeJob:
             while segmenter.is_alive():
                 while not stdout_queue.empty():
                     stdout = stdout_queue.get().strip()
-                    match = re.search(r"Opening '(.+?)' for writing", stdout)
+                    match = re.search(r"The file '(.+?)' has been opened for writing.", stdout)
 
                     if match:
-                        line = match.group(1)
-                        if line.endswith('list.txt'):
-                            last_line = line
+                        filename = match.group(1)
 
-                        elif not last_line.endswith('list.txt'):
-                            self.add_segment(source_fullpath=last_line, segment_list=segment_list,
-                                             segment_list_lock=segment_list_lock, global_frames=global_frames)
-                            last_line = line
-                            self.num_segments.value += 1
+                    if match or stdout.startswith('Multiplexing took'):
+                        if last_filename == "":
+                            last_filename = filename
+                            pass
 
                         else:
-                            last_line = line
+                            self.add_segment(source_fullpath=last_filename, segment_list=segment_list,
+                                             segment_list_lock=segment_list_lock, global_frames=global_frames)
+                            match = re.search(r".*/([^/]+).*", last_filename)
 
-                    elif 'muxing overhead' in stdout:
-                        self.add_segment(source_fullpath=last_line, segment_list=segment_list,
-                                         segment_list_lock=segment_list_lock, global_frames=global_frames)
-                        self.num_segments.value += 1
+                            if match:  # APPEASE MYPY ALWAYS
+                                with open(self.segment_input_txt, 'a') as file:
+                                    file.write(f'{match.group(1)}\n')
+
+                            last_filename = filename
+
+                            self.num_segments.value += 1
 
             with open(self.segment_input_txt, 'a') as file:
                 file.write('completed')
@@ -1164,8 +1202,11 @@ def main() -> None:
                                                     title="Mux Info"))
                 while not (stderr_queue.empty()):
                     layout['stderr'].update(Panel(tui.update_stderr(stderr_queue, info_height - 2), title="stderr"))
-
+#
                 time.sleep(1)
+
+        while True:
+            test = 1
 
     except KeyboardInterrupt:
         kill_cmd = (
